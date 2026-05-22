@@ -15,7 +15,7 @@ class Config:
     groq_api_key: str
     elevenlabs_api_key: str
     elevenlabs_voice_id: str
-    picovoice_access_key: str
+    picovoice_access_key: str | None  # required from Phase 3 onwards
 
     # Hardware
     larry_hardware: str
@@ -51,7 +51,7 @@ def load_config() -> Config:
         groq_api_key=_require("GROQ_API_KEY"),
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),
-        picovoice_access_key=_require("PICOVOICE_ACCESS_KEY"),
+        picovoice_access_key=os.environ.get("PICOVOICE_ACCESS_KEY"),
         larry_hardware=os.environ.get("LARRY_HARDWARE", _default_hardware()),
         wake_word_keyword_path=os.environ.get("WAKE_WORD_KEYWORD_PATH"),
         data_dir=data_dir,

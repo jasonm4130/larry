@@ -1,0 +1,34 @@
+# Larry systemd unit — Pi deploy
+#
+# Install:
+#   sudo cp systemd/larry.service /etc/systemd/system/larry.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable larry
+#   sudo systemctl start larry
+#
+# Logs:
+#   journalctl -u larry -f
+
+[Unit]
+Description=Larry — cursed AI Halloween skull
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+User=larry
+Group=larry
+SupplementaryGroups=gpio i2c audio
+
+WorkingDirectory=/home/larry/larry
+
+Environment=GPIOZERO_PIN_FACTORY=lgpio
+Environment=LARRY_HARDWARE=pca9685
+EnvironmentFile=/home/larry/larry/.env
+
+ExecStart=uv run larry
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

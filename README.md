@@ -24,12 +24,12 @@ Larry is a conversational skull. He has a wake word detector (listens for "Hey L
 ## Quick Start (macOS)
 
 ```bash
-cp .env.example .env
-# Fill in your API keys (Groq, Anthropic, ElevenLabs, Mem0 endpoint, Picovoice)
+brew install portaudio          # one-time system dep for audio I/O
+cp .env.example .env            # fill in your API keys
 
 uv sync
-uv run larry enroll yourname  # Record 10 seconds of your voice
-uv run larry                   # Start the skull
+uv run larry enroll yourname    # record 10 seconds of your voice
+uv run larry                    # start the skull
 ```
 
 On macOS, hardware is mocked—jaw angles print to stdout. The experience is otherwise identical.

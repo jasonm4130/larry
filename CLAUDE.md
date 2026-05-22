@@ -33,9 +33,12 @@ LocalAudioTransport
 
 macOS = dev, Pi 5 = production.
 
+- **macOS prerequisite**: `brew install portaudio` (Pipecat's `[local]` extra builds PyAudio against the system portaudio headers). Once is enough.
+- **Pi prerequisite**: `sudo apt install portaudio19-dev` (same reason, apt side).
 - **macOS**: `GPIOZERO_PIN_FACTORY=mock` makes all GPIO code no-ops. Run `uv sync` (no extras).
 - **Pi 5**: Uses `lgpio` pin factory (NOT `RPi.GPIO` — broken on Pi 5; NOT `pigpio` — no Pi 5 support). Run `uv sync --extra pi`.
 - **Pi-only deps** (`lgpio`, `adafruit-circuitpython-pca9685`, `adafruit-circuitpython-servokit`) live in `[project.optional-dependencies.pi]`.
+- **Dev tools** (`pytest`, `ruff`, `pyright`) live in `[dependency-groups.dev]` and install automatically with `uv sync`.
 
 ## Standard Commands
 

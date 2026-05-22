@@ -1,0 +1,59 @@
+[project]
+name = "larry"
+version = "0.0.1"
+description = "Cursed AI character in a Halloween skull on a Raspberry Pi 5."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "jasonm4130", email = "jasonm4130@gmail.com" }]
+
+dependencies = [
+    "pipecat-ai[anthropic,elevenlabs,groq,silero,mem0,local]>=0.0.108",
+    "pvporcupine",
+    "sounddevice",
+    "numpy",
+    "python-dotenv",
+    "resemblyzer",
+    "gpiozero",
+]
+
+[project.optional-dependencies]
+pi = [
+    "lgpio",
+    "adafruit-circuitpython-pca9685",
+    "adafruit-circuitpython-servokit",
+    "adafruit-blinka",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "pyright",
+]
+
+[project.scripts]
+larry = "larry.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/larry"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+include = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -33,6 +33,14 @@ class Config:
     jaw_closed_angle: int
     jaw_servo_channel: int
 
+    # Jaw lip-sync
+    jaw_noise_floor: float  # RMS level treated as silence (normalisation floor)
+    jaw_peak: float  # RMS level treated as full-open (normalisation ceiling)
+
+    # Idle / proactive behaviour
+    idle_timeout_s: float  # seconds of user silence before proactive utterance fires
+    proactive_probability: float  # probability [0, 1] of speaking on each idle trigger
+
 
 def load_config() -> Config:
     def _require(key: str) -> str:
@@ -62,4 +70,8 @@ def load_config() -> Config:
         jaw_open_angle=60,
         jaw_closed_angle=0,
         jaw_servo_channel=0,
+        jaw_noise_floor=float(os.environ.get("JAW_NOISE_FLOOR", "0.01")),
+        jaw_peak=float(os.environ.get("JAW_PEAK", "0.3")),
+        idle_timeout_s=float(os.environ.get("IDLE_TIMEOUT_S", "600")),
+        proactive_probability=float(os.environ.get("PROACTIVE_PROBABILITY", "1.0")),
     )

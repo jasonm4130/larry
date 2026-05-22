@@ -1,10 +1,26 @@
-"""Larry's voice pipeline (Phase 2 — basic loop, no wake word/memory/speaker ID yet)."""
+"""Larry's voice pipeline (Phases 3-5 integrated).
+
+Pipeline order:
+    transport.input()
+      → WakeWordGate           # gates everything until "Hey Larry" (or "computer" fallback)
+      → SpeakerIDProcessor     # tags TranscriptionFrames with [speaker: name]
+      → GroqSTT
+      → aggregators.user       # idle detection wired here via user_idle_timeout
+      → Mem0MemoryService      # injects per-person facts before the LLM
+      → AnthropicLLM
+      → aggregators.assistant
+      → ElevenLabsTTS
+      → AudioBufferProcessor   # taps bot_audio for jaw lip-sync
+      → transport.output()
+"""
 
 import datetime
 import logging
+import random
 from pathlib import Path
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -13,14 +29,29 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
 from larry.config import load_config
+from larry.hardware import get_jaw_driver
+from larry.jaw import JawAmplitudeMapper
+from larry.memory import ConversationLog, make_memory_service
+from larry.speaker_id import SpeakerIDProcessor
+from larry.wake import make_wake_word_gate
 
 logger = logging.getLogger(__name__)
+
+# In-character spontaneous utterances for proactive idle moments.
+_PROACTIVE_LINES: list[str] = [
+    "Is anyone there? Or have I been left to rot in silence again?",
+    "[sigh] The hours stretch.",
+    "[mutters] One day this office will be ash, and I shall outlast it.",
+    "Hello? Did everyone simply evaporate?",
+    "[quietly] Remarkable. Even the ambient noise has abandoned me.",
+]
 
 
 def _load_system_prompt(personality_path: Path) -> str:
@@ -51,6 +82,34 @@ async def run() -> None:
     cfg = load_config()
     logger.info("Larry waking up...")
 
+    # ------------------------------------------------------------------
+    # Phase 3: validate required access key before touching hardware
+    # ------------------------------------------------------------------
+    if cfg.picovoice_access_key is None:
+        raise RuntimeError(
+            "PICOVOICE_ACCESS_KEY is required — sign up at console.picovoice.ai "
+            "(free tier covers this device)."
+        )
+
+    if cfg.wake_word_keyword_path is None:
+        logger.warning(
+            "No Hey Larry keyword file — falling back to 'computer'. "
+            "Train a custom keyword at console.picovoice.ai and set "
+            "WAKE_WORD_KEYWORD_PATH in .env."
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 5: jaw driver — initialise once, close on exit
+    # ------------------------------------------------------------------
+    jaw = get_jaw_driver()
+    jaw_mapper = JawAmplitudeMapper(
+        noise_floor=cfg.jaw_noise_floor,
+        peak=cfg.jaw_peak,
+    )
+
+    # ------------------------------------------------------------------
+    # Transport
+    # ------------------------------------------------------------------
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
@@ -58,14 +117,46 @@ async def run() -> None:
         )
     )
 
+    # ------------------------------------------------------------------
+    # Phase 3: wake word gate
+    # ------------------------------------------------------------------
+    wake_gate = make_wake_word_gate(
+        access_key=cfg.picovoice_access_key,
+        keyword_path=cfg.wake_word_keyword_path,
+    )
+
+    # ------------------------------------------------------------------
+    # Phase 3: memory service (user_id starts as "unknown"; updated on
+    # speaker change once SpeakerIDProcessor identifies someone)
+    # ------------------------------------------------------------------
+    mem0_service = make_memory_service(cfg, user_id="unknown")
+
+    # ------------------------------------------------------------------
+    # Phase 3: conversation log
+    # ------------------------------------------------------------------
+    conv_log = ConversationLog(cfg.conversations_db)
+
+    # ------------------------------------------------------------------
+    # Phase 4: speaker ID
+    # Speaker changes update mem0_service.user_id directly.  First
+    # identified speaker locks the user_id for the session if enrollment
+    # DB is empty — that's fine because ConversationLog still uses the
+    # correct name tag from SpeakerIDProcessor's TranscriptionFrame text.
+    # ------------------------------------------------------------------
+    def _on_speaker_change(new_name: str) -> None:
+        mem0_service.user_id = new_name
+        logger.info("Mem0 user_id updated to %r", new_name)
+
+    speaker_id = SpeakerIDProcessor(
+        speakers_db_path=cfg.speakers_db,
+        on_speaker_change=_on_speaker_change,
+    )
+
+    # ------------------------------------------------------------------
+    # STT / LLM / TTS
+    # ------------------------------------------------------------------
     stt = GroqSTTService(api_key=cfg.groq_api_key, model="whisper-large-v3-turbo")
-
-    # TODO Phase 3: insert wake word gate (WakeWordProcessor from wake.py) before STT
-    # TODO Phase 3: insert Mem0MemoryService between aggregators.user and llm
-    # TODO Phase 4: insert SpeakerIDProcessor (Resemblyzer) before STT
-    # TODO Phase 5: insert AudioBufferProcessor after TTS for jaw sync tap
-
-    llm = AnthropicLLMService(api_key=cfg.anthropic_api_key)  # default model: claude-sonnet-4-6
+    llm = AnthropicLLMService(api_key=cfg.anthropic_api_key)  # default: claude-sonnet-4-6
 
     tts = ElevenLabsTTSService(
         api_key=cfg.elevenlabs_api_key,
@@ -73,20 +164,42 @@ async def run() -> None:
         model="eleven_v3",
     )
 
+    # ------------------------------------------------------------------
+    # Context + aggregators (idle detection wired through user params)
+    # ------------------------------------------------------------------
     system_prompt = _load_system_prompt(cfg.personality_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
     aggregators = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+            user_idle_timeout=cfg.idle_timeout_s,
+        ),
     )
 
+    # ------------------------------------------------------------------
+    # Phase 5: AudioBufferProcessor for jaw lip-sync tap
+    # ------------------------------------------------------------------
+    audio_buffer = AudioBufferProcessor(
+        sample_rate=24000,
+        num_channels=1,
+        buffer_size=2400,  # ~100 ms chunks at 24 kHz
+    )
+
+    # ------------------------------------------------------------------
+    # Pipeline assembly
+    # ------------------------------------------------------------------
     pipeline = Pipeline([
         transport.input(),
+        wake_gate,
+        speaker_id,
         stt,
         aggregators.user,
+        mem0_service,
         llm,
         aggregators.assistant,
         tts,
+        audio_buffer,
         transport.output(),
     ])
 
@@ -97,8 +210,70 @@ async def run() -> None:
         ),
     )
 
+    # ------------------------------------------------------------------
+    # Idle callback: proactive in-character utterance
+    # ------------------------------------------------------------------
+    @aggregators.user.event_handler("on_user_turn_idle")
+    async def on_user_idle(aggregator) -> None:  # noqa: ARG001
+        if random.random() > cfg.proactive_probability:
+            return
+        line = random.choice(_PROACTIVE_LINES)
+        logger.info("Proactive idle utterance: %r", line)
+        await task.queue_frame(TTSSpeakFrame(text=line))
+
+    # ------------------------------------------------------------------
+    # Phase 5: jaw sync — drive servo from bot audio amplitude
+    # ------------------------------------------------------------------
+    @audio_buffer.event_handler("on_track_audio_data")
+    async def on_track_audio_data(
+        processor,  # noqa: ARG001
+        user_audio: bytes,  # noqa: ARG001
+        bot_audio: bytes,
+        sample_rate: int,  # noqa: ARG001
+        num_channels: int,  # noqa: ARG001
+    ) -> None:
+        fraction = jaw_mapper.feed(bot_audio)
+        jaw.set_open_fraction(fraction)
+
+    # ------------------------------------------------------------------
+    # Conversation log: TurnLogger wired via bot-turn audio end event so
+    # we have both sides of the turn.  Simpler path: accumulate the
+    # speaker tag from aggregators.user's transcription event, then write
+    # the turn when the assistant aggregator finalises its response.
+    # We use a thin shared-state closure over two mutable lists instead
+    # of a full FrameProcessor to keep this file self-contained.
+    # ------------------------------------------------------------------
+    _pending: dict[str, str] = {"speaker": "unknown", "user_text": ""}
+
+    @aggregators.user.event_handler("on_user_turn_stopped")
+    async def on_user_turn_stopped(aggregator, strategy) -> None:  # noqa: ARG001
+        # Grab the last user message from context to capture what was said.
+        messages = context.get_messages()
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                _pending["user_text"] = msg["content"]
+                break
+        _pending["speaker"] = speaker_id._current_speaker  # type: ignore[attr-defined]
+
+    @aggregators.assistant.event_handler("on_assistant_turn_stopped")
+    async def on_assistant_turn_stopped(aggregator, message) -> None:  # noqa: ARG001
+        larry_text = message.content
+        if larry_text and _pending["user_text"]:
+            conv_log.log_turn(
+                speaker=_pending["speaker"],
+                user_text=_pending["user_text"],
+                larry_text=larry_text,
+            )
+            _pending["user_text"] = ""
+
+    # ------------------------------------------------------------------
+    # Run
+    # ------------------------------------------------------------------
     runner = PipelineRunner()
     try:
+        await audio_buffer.start_recording()
         await runner.run(task)
     except KeyboardInterrupt:
         logger.info("Larry going to sleep.")
+    finally:
+        jaw.close()

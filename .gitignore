@@ -1,0 +1,42 @@
+# Secrets — NEVER commit
+.env
+.env.local
+*.key
+*.pem
+
+# Picovoice wake-word model (per-user license, not redistributable)
+*.ppn
+
+# Audio dumps from debugging
+*.pcm
+*.wav
+*.mp3
+
+# Runtime data — speaker embeddings, Mem0 store, conversation log
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+*.egg-info/
+build/
+dist/
+
+# uv
+.uv/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~

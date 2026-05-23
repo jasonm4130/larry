@@ -149,7 +149,7 @@ async def run() -> None:
     tts = ElevenLabsTTSService(
         api_key=cfg.elevenlabs_api_key,
         voice_id=cfg.elevenlabs_voice_id,
-        model="eleven_v3",
+        model=cfg.elevenlabs_model,
     )
 
     # ------------------------------------------------------------------

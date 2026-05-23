@@ -17,6 +17,7 @@ class Config:
     groq_api_key: str
     elevenlabs_api_key: str
     elevenlabs_voice_id: str
+    elevenlabs_model: str  # default eleven_turbo_v2_5; v3 needs alpha access
 
     # Hardware
     larry_hardware: str
@@ -63,6 +64,7 @@ def load_config() -> Config:
         groq_api_key=_require("GROQ_API_KEY"),
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),
+        elevenlabs_model=os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
         larry_hardware=os.environ.get("LARRY_HARDWARE", _default_hardware()),
         wake_word_model=os.environ.get("WAKE_WORD_MODEL", "hey_jarvis"),
         wake_word_custom_path=os.environ.get("WAKE_WORD_CUSTOM_PATH"),

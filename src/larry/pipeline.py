@@ -2,13 +2,14 @@
 
 Pipeline order:
     transport.input()
-      → WakeWordGate           # gates everything until "Hey Larry" (or "computer" fallback)
+      → WakeWordGate           # gates everything until "Hey Larry" (or "hey_jarvis" fallback)
+      → VADProcessor           # emits VADUser{Started,Stopped}SpeakingFrame for STT segmentation
       → SpeakerIDProcessor     # tags TranscriptionFrames with [speaker: name]
       → GroqSTT
-      → aggregators.user       # idle detection wired here via user_idle_timeout
+      → user_agg               # idle detection wired here via user_idle_timeout
       → Mem0MemoryService      # injects per-person facts before the LLM
       → OpenAILLM (via OpenRouter)
-      → aggregators.assistant
+      → assistant_agg
       → ElevenLabsTTS
       → AudioBufferProcessor   # taps bot_audio for jaw lip-sync
       → transport.output()
@@ -30,6 +31,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -110,6 +112,14 @@ async def run() -> None:
     )
 
     # ------------------------------------------------------------------
+    # VAD processor: emits VADUserStartedSpeakingFrame / VADUserStoppedSpeakingFrame
+    # upstream of STT.  Without this, Pipecat's SegmentedSTTService (which
+    # GroqSTTService extends) never knows when to flush its audio buffer
+    # to Groq, and no transcription ever fires.
+    # ------------------------------------------------------------------
+    vad_processor = VADProcessor(vad_analyzer=SileroVADAnalyzer())
+
+    # ------------------------------------------------------------------
     # Phase 3: memory service (user_id starts as "unknown"; updated on
     # speaker change once SpeakerIDProcessor identifies someone)
     # ------------------------------------------------------------------
@@ -185,6 +195,7 @@ async def run() -> None:
     pipeline = Pipeline([
         transport.input(),
         wake_gate,
+        vad_processor,
         speaker_id,
         stt,
         user_agg,

@@ -1,9 +1,11 @@
 """Wake-word gate: holds the pipeline asleep until the configured wake word is detected."""
 
 import struct
+from pathlib import Path
 from time import monotonic
 
 import numpy as np
+import openwakeword
 from loguru import logger
 from openwakeword.model import Model
 from pipecat.frames.frames import Frame, InputAudioRawFrame, SystemFrame
@@ -11,6 +13,18 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 _SAMPLE_RATE = 16000
 _CHUNK_SAMPLES = 1280  # 80 ms at 16 kHz — OpenWakeWord's required frame size
+
+
+def _resolve_pretrained_path(name: str) -> str:
+    """Map a friendly name like 'hey_jarvis' to its bundled .onnx file path."""
+    for path in openwakeword.get_pretrained_model_paths():
+        if Path(path).stem.startswith(name):
+            return path
+    available = [Path(p).stem for p in openwakeword.get_pretrained_model_paths()]
+    raise ValueError(
+        f"Unknown OpenWakeWord model {name!r}. Bundled options: {available}. "
+        "For a custom 'Hey Larry' model, set WAKE_WORD_CUSTOM_PATH to a .onnx file."
+    )
 
 
 class WakeWordGate(FrameProcessor):
@@ -109,26 +123,29 @@ def make_wake_word_gate(
 ) -> WakeWordGate:
     """Build a WakeWordGate backed by OpenWakeWord (Apache-2.0, no API key needed).
 
-    If custom_model_path is provided, loads that .onnx file instead of the
-    named pretrained model.  Models auto-download to the openwakeword cache
-    directory on first use.
+    If custom_model_path is provided, loads that .onnx file. Otherwise resolves
+    model_name (e.g. 'hey_jarvis') to one of the .onnx files bundled with the
+    openwakeword package (no download).
     """
     if custom_model_path is not None:
-        model = Model(wakeword_models=[custom_model_path], inference_framework="onnx")
-        effective_name = custom_model_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        model_path = custom_model_path
     else:
+        model_path = _resolve_pretrained_path(model_name)
         logger.info(
-            "Loading OpenWakeWord pretrained model '{}'. "
+            "Loading OpenWakeWord pretrained model '{}' from {}. "
             "Train a custom 'Hey Larry' via the OpenWakeWord Colab and set "
             "WAKE_WORD_CUSTOM_PATH to use it instead.",
             model_name,
+            model_path,
         )
-        model = Model(wakeword_models=[model_name], inference_framework="onnx")
-        effective_name = model_name
+
+    model = Model(wakeword_model_paths=[model_path])
+    # predict() returns a dict keyed by the .onnx filename stem (e.g. "hey_jarvis_v0.1").
+    score_key = Path(model_path).stem
 
     return WakeWordGate(
         model=model,
-        model_name=effective_name,
+        model_name=score_key,
         threshold=threshold,
         sleep_timeout_s=sleep_timeout_s,
     )

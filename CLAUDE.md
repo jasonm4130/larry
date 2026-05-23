@@ -20,7 +20,7 @@ LocalAudioTransport
   → transport.output
 ```
 
-**Wake word** ("Hey Larry") gates the pipeline via custom `FrameProcessor` in `wake.py` — Pipecat has no first-party Porcupine plugin. All other services use first-party Pipecat implementations.
+**Wake word** ("Hey Larry") gates the pipeline via custom `FrameProcessor` in `wake.py` — OpenWakeWord (Apache-2.0, no API key). Default model `hey_jarvis`. Train a custom "Hey Larry" via the [OpenWakeWord Colab](https://colab.research.google.com/drive/1q1oe2zOyZp7UsB3jJiQ1IFn8z5YfjwEb) and point `WAKE_WORD_CUSTOM_PATH` at the resulting .onnx file.
 
 ## Where to Make Changes
 
@@ -53,7 +53,8 @@ macOS = dev, Pi 5 = production.
 - **OPENROUTER_API_KEY**: chat LLM (Claude Sonnet 4.6 by default) + Mem0 fact extraction (Claude Haiku 4.5). Single key for both via OpenRouter.
 - **GROQ_API_KEY**: Groq Whisper-large-v3-turbo (STT).
 - **ELEVENLABS_API_KEY**: ElevenLabs v3 (TTS).
-- **PICOVOICE_ACCESS_KEY**: Porcupine wake word.
+
+Wake word runs locally via OpenWakeWord (Apache-2.0) — no API key required.
 
 Embeddings (Mem0 vector layer) run locally via FastEmbed (BAAI/bge-small-en-v1.5, ONNX, in-process) — no API key, no recurring cost. The `[local]` extra of Pipecat already pulls the audio stack; `fastembed` adds the embedding runtime.
 

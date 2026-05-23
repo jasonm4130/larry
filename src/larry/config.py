@@ -17,11 +17,11 @@ class Config:
     groq_api_key: str
     elevenlabs_api_key: str
     elevenlabs_voice_id: str
-    picovoice_access_key: str | None  # required from Phase 3 onwards
 
     # Hardware
     larry_hardware: str
-    wake_word_keyword_path: str | None
+    wake_word_model: str  # OpenWakeWord pretrained model name (default: hey_jarvis)
+    wake_word_custom_path: str | None  # path to a custom .onnx model, if any
 
     # Paths
     data_dir: Path
@@ -63,9 +63,9 @@ def load_config() -> Config:
         groq_api_key=_require("GROQ_API_KEY"),
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),
-        picovoice_access_key=os.environ.get("PICOVOICE_ACCESS_KEY"),
         larry_hardware=os.environ.get("LARRY_HARDWARE", _default_hardware()),
-        wake_word_keyword_path=os.environ.get("WAKE_WORD_KEYWORD_PATH"),
+        wake_word_model=os.environ.get("WAKE_WORD_MODEL", "hey_jarvis"),
+        wake_word_custom_path=os.environ.get("WAKE_WORD_CUSTOM_PATH"),
         data_dir=data_dir,
         speakers_db=data_dir / "speakers.db",
         conversations_db=data_dir / "conversations.db",

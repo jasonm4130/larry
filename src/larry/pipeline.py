@@ -83,22 +83,6 @@ async def run() -> None:
     logger.info("Larry waking up...")
 
     # ------------------------------------------------------------------
-    # Phase 3: validate required access key before touching hardware
-    # ------------------------------------------------------------------
-    if cfg.picovoice_access_key is None:
-        raise RuntimeError(
-            "PICOVOICE_ACCESS_KEY is required — sign up at console.picovoice.ai "
-            "(free tier covers this device)."
-        )
-
-    if cfg.wake_word_keyword_path is None:
-        logger.warning(
-            "No Hey Larry keyword file — falling back to 'computer'. "
-            "Train a custom keyword at console.picovoice.ai and set "
-            "WAKE_WORD_KEYWORD_PATH in .env."
-        )
-
-    # ------------------------------------------------------------------
     # Phase 5: jaw driver — initialise once, close on exit
     # ------------------------------------------------------------------
     jaw = get_jaw_driver()
@@ -118,11 +102,11 @@ async def run() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Phase 3: wake word gate
+    # Wake word gate (OpenWakeWord — Apache-2.0, no API key needed)
     # ------------------------------------------------------------------
     wake_gate = make_wake_word_gate(
-        access_key=cfg.picovoice_access_key,
-        keyword_path=cfg.wake_word_keyword_path,
+        model_name=cfg.wake_word_model,
+        custom_model_path=cfg.wake_word_custom_path,
     )
 
     # ------------------------------------------------------------------

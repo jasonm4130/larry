@@ -4,7 +4,7 @@ A cursed Halloween skull living on your office desk. Raspberry Pi 5 inside, moto
 
 ## What Is This
 
-Larry is a conversational skull. He has a wake word detector (listens for "Hey Larry"), understands speech via cloud Whisper, generates responses via Claude, and runs them through text-to-speech with custom audio tags like `[cackle]` and `[whispers]`. A PCA9685 servo driver moves his jaw while he speaks. He remembers who you are after you enroll (10 seconds of voice), and his personality is entirely driven by a Markdown file you can edit to make him meaner, sillier, or more pretentious.
+Larry is a conversational skull. He has a local wake word detector (listens for "Hey Larry" via OpenWakeWord — no account needed), understands speech via cloud Whisper, generates responses via Claude, and runs them through text-to-speech with custom audio tags like `[cackle]` and `[whispers]`. A PCA9685 servo driver moves his jaw while he speaks. He remembers who you are after you enroll (10 seconds of voice), and his personality is entirely driven by a Markdown file you can edit to make him meaner, sillier, or more pretentious.
 
 **TL;DR:** It's a toy for offices. Not practical. Extremely fun.
 
@@ -13,7 +13,7 @@ Larry is a conversational skull. He has a wake word detector (listens for "Hey L
 | Component | Service/Library |
 |-----------|-----------------|
 | Orchestration | Pipecat |
-| Wake word | Picovoice Porcupine |
+| Wake word | OpenWakeWord (local, no key) |
 | Speech-to-text | Groq Whisper-large-v3-turbo |
 | LLM | Claude Sonnet 4.6 via OpenRouter |
 | Text-to-speech | ElevenLabs v3 (custom audio tags) |
@@ -25,7 +25,7 @@ Larry is a conversational skull. He has a wake word detector (listens for "Hey L
 
 ```bash
 brew install portaudio          # one-time system dep for audio I/O
-cp .env.example .env            # fill in API keys (OpenRouter + Groq + ElevenLabs + Picovoice)
+cp .env.example .env            # fill in API keys (OpenRouter + Groq + ElevenLabs)
 
 uv sync
 uv run larry enroll yourname    # record 10 seconds of your voice

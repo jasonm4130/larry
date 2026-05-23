@@ -1,14 +1,16 @@
-"""Wake-word gate: holds the pipeline asleep until 'Hey Larry' is detected."""
+"""Wake-word gate: holds the pipeline asleep until the configured wake word is detected."""
 
 import struct
 from time import monotonic
 
-import pvporcupine
+import numpy as np
 from loguru import logger
+from openwakeword.model import Model
 from pipecat.frames.frames import Frame, InputAudioRawFrame, SystemFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-_PORCUPINE_SAMPLE_RATE = 16000
+_SAMPLE_RATE = 16000
+_CHUNK_SAMPLES = 1280  # 80 ms at 16 kHz — OpenWakeWord's required frame size
 
 
 class WakeWordGate(FrameProcessor):
@@ -21,20 +23,20 @@ class WakeWordGate(FrameProcessor):
 
     def __init__(
         self,
-        porcupine: pvporcupine.Porcupine,
+        model: Model,
+        model_name: str,
+        threshold: float = 0.5,
         sleep_timeout_s: float = 30.0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self._porcupine = porcupine
+        self._model = model
+        self._model_name = model_name
+        self._threshold = threshold
         self._sleep_timeout_s = sleep_timeout_s
         self._awake: bool = False
         self._last_voice_activity: float = 0.0
         self._pcm_buffer: list[int] = []
-
-    async def cleanup(self) -> None:
-        await super().cleanup()
-        self._porcupine.delete()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -53,7 +55,7 @@ class WakeWordGate(FrameProcessor):
     # ------------------------------------------------------------------
 
     async def _handle_audio(self, frame: InputAudioRawFrame, direction: FrameDirection) -> None:
-        """Route audio based on wake state; feed asleep audio to Porcupine."""
+        """Route audio based on wake state; feed asleep audio to OpenWakeWord."""
         if self._awake:
             # Check sleep timeout on every audio frame — cheap monotonic compare.
             if monotonic() - self._last_voice_activity > self._sleep_timeout_s:
@@ -65,8 +67,8 @@ class WakeWordGate(FrameProcessor):
                 await self.push_frame(frame, direction)
             return
 
-        # While asleep: feed audio to Porcupine; wake on detection.
-        if frame.sample_rate != _PORCUPINE_SAMPLE_RATE or frame.num_channels != 1:
+        # While asleep: feed audio to OpenWakeWord; wake on detection.
+        if frame.sample_rate != _SAMPLE_RATE or frame.num_channels != 1:
             logger.warning(
                 "WakeWordGate expects 16kHz mono audio, got {}Hz {}ch"
                 " — wake-word detection skipped.",
@@ -75,45 +77,58 @@ class WakeWordGate(FrameProcessor):
             )
             return
 
-        # Unpack int16 samples and accumulate into the ring buffer.
+        # Unpack int16 samples and accumulate into the buffer.
         n_samples = len(frame.audio) // 2
         samples = list(struct.unpack_from(f"{n_samples}h", frame.audio))
         self._pcm_buffer.extend(samples)
 
-        fl = self._porcupine.frame_length
-        while len(self._pcm_buffer) >= fl:
-            chunk = self._pcm_buffer[:fl]
-            self._pcm_buffer = self._pcm_buffer[fl:]
-            keyword_index = self._porcupine.process(chunk)
-            if keyword_index >= 0:
+        while len(self._pcm_buffer) >= _CHUNK_SAMPLES:
+            chunk = self._pcm_buffer[:_CHUNK_SAMPLES]
+            self._pcm_buffer = self._pcm_buffer[_CHUNK_SAMPLES:]
+            chunk_np = np.array(chunk, dtype=np.int16)
+            scores = self._model.predict(chunk_np)
+            score = scores.get(self._model_name, 0.0)
+            if score >= self._threshold:
                 self._awake = True
                 self._last_voice_activity = monotonic()
-                logger.info("Larry awoken by wake word (index={}).", keyword_index)
+                logger.info(
+                    "Larry awoken by wake word '{}' (score={:.3f}).",
+                    self._model_name,
+                    score,
+                )
                 # Forward this frame so the immediately following speech isn't lost.
                 await self.push_frame(frame, direction)
                 return
 
 
 def make_wake_word_gate(
-    access_key: str,
-    keyword_path: str | None = None,
+    model_name: str = "hey_jarvis",
+    custom_model_path: str | None = None,
     sleep_timeout_s: float = 30.0,
+    threshold: float = 0.5,
 ) -> WakeWordGate:
-    """Build a WakeWordGate.
+    """Build a WakeWordGate backed by OpenWakeWord (Apache-2.0, no API key needed).
 
-    If keyword_path is None, falls back to the built-in 'computer' keyword so
-    development works before a custom 'Hey Larry' model is trained in the
-    Picovoice Console.
+    If custom_model_path is provided, loads that .onnx file instead of the
+    named pretrained model.  Models auto-download to the openwakeword cache
+    directory on first use.
     """
-    if keyword_path is not None:
-        porcupine = pvporcupine.create(
-            access_key=access_key,
-            keyword_paths=[keyword_path],
-        )
+    if custom_model_path is not None:
+        model = Model(wakeword_models=[custom_model_path], inference_framework="onnx")
+        effective_name = custom_model_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     else:
-        logger.warning("No wake-word .ppn path provided — using built-in 'computer' keyword.")
-        porcupine = pvporcupine.create(
-            access_key=access_key,
-            keywords=["computer"],
+        logger.info(
+            "Loading OpenWakeWord pretrained model '{}'. "
+            "Train a custom 'Hey Larry' via the OpenWakeWord Colab and set "
+            "WAKE_WORD_CUSTOM_PATH to use it instead.",
+            model_name,
         )
-    return WakeWordGate(porcupine=porcupine, sleep_timeout_s=sleep_timeout_s)
+        model = Model(wakeword_models=[model_name], inference_framework="onnx")
+        effective_name = model_name
+
+    return WakeWordGate(
+        model=model,
+        model_name=effective_name,
+        threshold=threshold,
+        sleep_timeout_s=sleep_timeout_s,
+    )

@@ -8,7 +8,7 @@ authors = [{ name = "jasonm4130", email = "jasonm4130@gmail.com" }]
 
 dependencies = [
     "pipecat-ai[anthropic,elevenlabs,groq,silero,mem0,local]>=0.0.108",
-    "pvporcupine",
+    "openwakeword",
     "sounddevice",
     "numpy",
     "python-dotenv",

@@ -1,7 +1,10 @@
 """Per-person memory via Mem0 (self-hosted) and a SQLite conversation log.
 
-Embedding backend: OpenAI text-embedding-3-small (cheap, no local inference).
-  - Uses OPENAI_API_KEY directly; OpenRouter does not expose an embeddings endpoint.
+Embedding backend: FastEmbed (BAAI/bge-small-en-v1.5, ONNX, in-process).
+  - Fully local, zero API spend, no key required.
+  - ~80-120ms per query on a Pi 5; ~5-20ms on Apple Silicon.
+  - 384-dim vectors. MTEB ~60% (vs ~62% for OpenAI text-embedding-3-small) -
+    negligible for ~15-coworker fact retrieval.
 Fact-extraction LLM: anthropic/claude-haiku-4-5 via OpenRouter.
   - Mem0's OpenAI provider auto-routes to OpenRouter when OPENROUTER_API_KEY is set.
   - Haiku is the cheapest capable model for short fact-extraction prompts.
@@ -21,8 +24,8 @@ def make_memory_service(cfg: Any, *, user_id: str = "unknown") -> Mem0MemoryServ
 
     The service uses:
     - Qdrant (local path) for vector storage — persists across restarts.
-    - OpenAI text-embedding-3-small for embeddings — requires OPENAI_API_KEY.
-      (OpenRouter does not support embeddings as of May 2026.)
+    - FastEmbed (BAAI/bge-small-en-v1.5, 384-dim) for embeddings — fully local,
+      no API key, ONNX runtime in-process.
     - anthropic/claude-haiku-4.5 via OpenRouter for fact extraction — requires
       OPENROUTER_API_KEY (Mem0's OpenAI provider auto-detects it from env).
 
@@ -47,13 +50,11 @@ def make_memory_service(cfg: Any, *, user_id: str = "unknown") -> Mem0MemoryServ
             },
         },
         "embedder": {
-            # OpenRouter does not expose an embeddings endpoint (as of May 2026),
-            # so embeddings remain on OpenAI direct via OPENAI_API_KEY.
-            "provider": "openai",
+            # FastEmbed: in-process ONNX, no API key, no recurring cost.
+            # bge-small-en-v1.5: 384-dim, ~300MB on disk, ~80-120ms on Pi 5.
+            "provider": "fastembed",
             "config": {
-                # text-embedding-3-small: ~$0.02 / 1M tokens — negligible.
-                "model": "text-embedding-3-small",
-                "embedding_dims": 1536,
+                "model": "BAAI/bge-small-en-v1.5",
             },
         },
         "vector_store": {
@@ -61,7 +62,7 @@ def make_memory_service(cfg: Any, *, user_id: str = "unknown") -> Mem0MemoryServ
             "config": {
                 "collection_name": "larry_mem0",
                 "path": str(cfg.mem0_dir / "qdrant"),
-                "embedding_model_dims": 1536,
+                "embedding_model_dims": 384,
                 "on_disk": True,
             },
         },

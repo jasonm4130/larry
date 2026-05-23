@@ -51,8 +51,11 @@ macOS = dev, Pi 5 = production.
 ## API Keys
 
 - **OPENROUTER_API_KEY**: chat LLM (Claude Sonnet 4.6 by default) + Mem0 fact extraction (Claude Haiku 4.5). Single key for both via OpenRouter.
-- **OPENAI_API_KEY**: Mem0 embeddings only (`text-embedding-3-small`). OpenRouter does not expose an embeddings endpoint (verified May 2026).
-- **GROQ_API_KEY**, **ELEVENLABS_API_KEY**, **PICOVOICE_ACCESS_KEY**: unchanged, do not go through OpenRouter.
+- **GROQ_API_KEY**: Groq Whisper-large-v3-turbo (STT).
+- **ELEVENLABS_API_KEY**: ElevenLabs v3 (TTS).
+- **PICOVOICE_ACCESS_KEY**: Porcupine wake word.
+
+Embeddings (Mem0 vector layer) run locally via FastEmbed (BAAI/bge-small-en-v1.5, ONNX, in-process) — no API key, no recurring cost. The `[local]` extra of Pipecat already pulls the audio stack; `fastembed` adds the embedding runtime.
 
 ## Pipecat-Specific Gotchas
 

@@ -14,6 +14,7 @@ dependencies = [
     "python-dotenv",
     "resemblyzer",
     "gpiozero",
+    "fastembed",
 ]
 
 [project.optional-dependencies]

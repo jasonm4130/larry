@@ -25,7 +25,7 @@ Larry is a conversational skull. He has a wake word detector (listens for "Hey L
 
 ```bash
 brew install portaudio          # one-time system dep for audio I/O
-cp .env.example .env            # fill in API keys (OpenRouter + OpenAI + Groq + ElevenLabs)
+cp .env.example .env            # fill in API keys (OpenRouter + Groq + ElevenLabs + Picovoice)
 
 uv sync
 uv run larry enroll yourname    # record 10 seconds of your voice

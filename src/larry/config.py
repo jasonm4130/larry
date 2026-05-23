@@ -14,7 +14,6 @@ class Config:
     openrouter_api_key: str
     openrouter_base_url: str  # default: https://openrouter.ai/api/v1
     llm_model: str  # default: anthropic/claude-sonnet-4-6; override via LLM_MODEL
-    openai_api_key: str | None  # used only by Mem0 for text-embedding-3-small
     groq_api_key: str
     elevenlabs_api_key: str
     elevenlabs_voice_id: str
@@ -61,7 +60,6 @@ def load_config() -> Config:
         openrouter_api_key=_require("OPENROUTER_API_KEY"),
         openrouter_base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         llm_model=os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4-6"),
-        openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
         groq_api_key=_require("GROQ_API_KEY"),
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),

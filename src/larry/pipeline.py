@@ -154,6 +154,9 @@ async def run() -> None:
 
     # ------------------------------------------------------------------
     # Context + aggregators (idle detection wired through user params)
+    # `.user` / `.assistant` are methods in Pipecat 1.2.1 — call once and
+    # reuse the returned processor instances for both the pipeline list
+    # and the event-handler decorators.
     # ------------------------------------------------------------------
     system_prompt = _load_system_prompt(cfg.personality_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
@@ -164,6 +167,8 @@ async def run() -> None:
             user_idle_timeout=cfg.idle_timeout_s,
         ),
     )
+    user_agg = aggregators.user()
+    assistant_agg = aggregators.assistant()
 
     # ------------------------------------------------------------------
     # Phase 5: AudioBufferProcessor for jaw lip-sync tap
@@ -182,10 +187,10 @@ async def run() -> None:
         wake_gate,
         speaker_id,
         stt,
-        aggregators.user,
+        user_agg,
         mem0_service,
         llm,
-        aggregators.assistant,
+        assistant_agg,
         tts,
         audio_buffer,
         transport.output(),
@@ -201,7 +206,7 @@ async def run() -> None:
     # ------------------------------------------------------------------
     # Idle callback: proactive in-character utterance
     # ------------------------------------------------------------------
-    @aggregators.user.event_handler("on_user_turn_idle")
+    @user_agg.event_handler("on_user_turn_idle")
     async def on_user_idle(aggregator) -> None:  # noqa: ARG001
         if random.random() > cfg.proactive_probability:
             return
@@ -233,7 +238,7 @@ async def run() -> None:
     # ------------------------------------------------------------------
     _pending: dict[str, str] = {"speaker": "unknown", "user_text": ""}
 
-    @aggregators.user.event_handler("on_user_turn_stopped")
+    @user_agg.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(aggregator, strategy) -> None:  # noqa: ARG001
         # Grab the last user message from context to capture what was said.
         messages = context.get_messages()
@@ -243,7 +248,7 @@ async def run() -> None:
                 break
         _pending["speaker"] = speaker_id._current_speaker  # type: ignore[attr-defined]
 
-    @aggregators.assistant.event_handler("on_assistant_turn_stopped")
+    @assistant_agg.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message) -> None:  # noqa: ARG001
         larry_text = message.content
         if larry_text and _pending["user_text"]:

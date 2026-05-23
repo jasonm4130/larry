@@ -7,7 +7,7 @@ Pipeline order:
       → GroqSTT
       → aggregators.user       # idle detection wired here via user_idle_timeout
       → Mem0MemoryService      # injects per-person facts before the LLM
-      → AnthropicLLM
+      → OpenAILLM (via OpenRouter)
       → aggregators.assistant
       → ElevenLabsTTS
       → AudioBufferProcessor   # taps bot_audio for jaw lip-sync
@@ -30,9 +30,9 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
-from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.groq.stt import GroqSTTService
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
 from larry.config import load_config
@@ -156,7 +156,11 @@ async def run() -> None:
     # STT / LLM / TTS
     # ------------------------------------------------------------------
     stt = GroqSTTService(api_key=cfg.groq_api_key, model="whisper-large-v3-turbo")
-    llm = AnthropicLLMService(api_key=cfg.anthropic_api_key)  # default: claude-sonnet-4-6
+    llm = OpenAILLMService(
+        api_key=cfg.openrouter_api_key,
+        base_url=cfg.openrouter_base_url,
+        model=cfg.llm_model,
+    )
 
     tts = ElevenLabsTTSService(
         api_key=cfg.elevenlabs_api_key,

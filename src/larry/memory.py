@@ -1,7 +1,10 @@
 """Per-person memory via Mem0 (self-hosted) and a SQLite conversation log.
 
 Embedding backend: OpenAI text-embedding-3-small (cheap, no local inference).
-Fact-extraction LLM: Anthropic claude-3-haiku-20240307 (fast, low-cost).
+  - Uses OPENAI_API_KEY directly; OpenRouter does not expose an embeddings endpoint.
+Fact-extraction LLM: anthropic/claude-haiku-4-5 via OpenRouter.
+  - Mem0's OpenAI provider auto-routes to OpenRouter when OPENROUTER_API_KEY is set.
+  - Haiku is the cheapest capable model for short fact-extraction prompts.
 Vector store: Qdrant with a local path under cfg.mem0_dir (no server needed).
 """
 
@@ -18,8 +21,10 @@ def make_memory_service(cfg: Any, *, user_id: str = "unknown") -> Mem0MemoryServ
 
     The service uses:
     - Qdrant (local path) for vector storage — persists across restarts.
-    - OpenAI text-embedding-3-small for embeddings — no local model required.
-    - Anthropic claude-3-haiku for fact extraction — uses cfg.anthropic_api_key.
+    - OpenAI text-embedding-3-small for embeddings — requires OPENAI_API_KEY.
+      (OpenRouter does not support embeddings as of May 2026.)
+    - anthropic/claude-haiku-4.5 via OpenRouter for fact extraction — requires
+      OPENROUTER_API_KEY (Mem0's OpenAI provider auto-detects it from env).
 
     Blocking Mem0 calls are already wrapped in asyncio.to_thread by the
     Pipecat plugin (pipecat.services.mem0.memory, resolved upstream issue #1741),
@@ -29,14 +34,21 @@ def make_memory_service(cfg: Any, *, user_id: str = "unknown") -> Mem0MemoryServ
 
     local_config: dict[str, Any] = {
         "llm": {
-            "provider": "anthropic",
+            # Mem0's OpenAI provider auto-routes to OpenRouter when
+            # OPENROUTER_API_KEY is set in the environment — no explicit
+            # api_key needed here.
+            "provider": "openai",
             "config": {
-                "model": "claude-3-haiku-20240307",
-                "api_key": cfg.anthropic_api_key,
+                # anthropic/claude-haiku-4.5: $1/M in, $5/M out via OpenRouter.
+                # Fact-extraction prompts are short (~200 tokens in, ~50 out),
+                # so cost is well under a cent per conversation.
+                "model": "anthropic/claude-haiku-4.5",
                 "max_tokens": 2000,
             },
         },
         "embedder": {
+            # OpenRouter does not expose an embeddings endpoint (as of May 2026),
+            # so embeddings remain on OpenAI direct via OPENAI_API_KEY.
             "provider": "openai",
             "config": {
                 # text-embedding-3-small: ~$0.02 / 1M tokens — negligible.

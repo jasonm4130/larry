@@ -14,7 +14,7 @@ LocalAudioTransport
   → SpeakerID (Resemblyzer)
   → GroqSTT
   → Mem0 (short-term memory)
-  → AnthropicLLM
+  → OpenAILLM (via OpenRouter → Claude Sonnet 4.6)
   → ElevenLabsTTS
   → AudioBufferProcessor (tap for jaw sync)
   → transport.output
@@ -26,7 +26,7 @@ LocalAudioTransport
 
 - **Personality / vibe**: `src/larry/personality/larry.md` (character card). Never edit prompts in `pipeline.py`.
 - **Audio tags** (`[cackle]`, `[whispers]`, etc.): also `personality/larry.md` — there's an explicit allow-list.
-- **Pipeline plumbing** (services, model swaps): `src/larry/pipeline.py`.
+- **Pipeline plumbing** (services, model swaps): `src/larry/pipeline.py`. For LLM model swaps, set `LLM_MODEL` env var (e.g. `LLM_MODEL=google/gemini-2.5-pro`) — no code change needed.
 - **Hardware**: `src/larry/hardware/`. `JawDriver` Protocol in `src/larry/jaw.py`. Mock impl in `hardware/jaw_mock.py`, real impl in `hardware/jaw_pca9685.py`. Select via `LARRY_HARDWARE=mock|pca9685`; defaults to mock on macOS, pca9685 on Linux/aarch64.
 
 ## Cross-Platform Development
@@ -48,9 +48,15 @@ macOS = dev, Pi 5 = production.
 - `uv run pytest` — tests (Mac only; test code avoids hardware imports)
 - `uv run ruff check && uv run pyright` — lint and typecheck
 
+## API Keys
+
+- **OPENROUTER_API_KEY**: chat LLM (Claude Sonnet 4.6 by default) + Mem0 fact extraction (Claude Haiku 4.5). Single key for both via OpenRouter.
+- **OPENAI_API_KEY**: Mem0 embeddings only (`text-embedding-3-small`). OpenRouter does not expose an embeddings endpoint (verified May 2026).
+- **GROQ_API_KEY**, **ELEVENLABS_API_KEY**, **PICOVOICE_ACCESS_KEY**: unchanged, do not go through OpenRouter.
+
 ## Pipecat-Specific Gotchas
 
-- Default Claude model is `claude-sonnet-4-6` in `AnthropicLLMService` — don't override unless intentional.
+- Default LLM model is `anthropic/claude-sonnet-4-6` routed via OpenRouter through `OpenAILLMService`. Override with `LLM_MODEL` env var.
 - Proactive utterances (speak outside pipeline flow): `await task.queue_frame(TTSSpeakFrame("..."))`
 - User idle detection: `UserIdleProcessor` from `pipecat.processors.user_idle_processor` (NOT a transport hook).
 - Jaw sync: `AudioBufferProcessor` after TTS, register `@event_handler("on_track_audio_data")`, consume `bot_audio` (not `user_audio`).

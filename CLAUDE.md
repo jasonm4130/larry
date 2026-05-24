@@ -40,6 +40,16 @@ macOS = dev, Pi 5 = production.
 - **Pi-only deps** (`lgpio`, `adafruit-circuitpython-pca9685`, `adafruit-circuitpython-servokit`) live in `[project.optional-dependencies.pi]`.
 - **Dev tools** (`pytest`, `ruff`, `pyright`) live in `[dependency-groups.dev]` and install automatically with `uv sync`.
 
+## Audio Hardware
+
+- **macOS dev**: built-in laptop mic + speaker. Acoustic feedback is real (Whisper transcribes Larry's own TTS) — **use headphones for any serious testing**. The software AEC (`src/larry/audio_filter.py`, WebRTC AEC3 via `pywebrtc-audio`) is loaded but marginal on a single-device acoustic loop. See [issue #1](https://github.com/jasonm4130/larry/issues/1).
+- **Pi 5 production**: **Jabra Speak 510** (USB-A conference speakerphone — mic + speaker + hardware AEC in one device). Solves the single-enclosure feedback problem in hardware. UAC-compliant, no vendor drivers, `snd-usb-audio` auto-detects.
+  - **Known PipeWire bug**: on PipeWire ≥ 23.10 the *speaker* side of the Jabra goes silent (mic still works). Fix: add `default.clock.quantum = 2048` to `/etc/pipewire/pipewire.conf`. Ref: [Ubuntu #2059401](https://bugs.launchpad.net/ubuntu/+source/pipewire/+bug/2059401).
+  - **Stay on Bookworm kernel 6.6**, not Trixie 6.12 — USB audio dropouts reported on 6.12.
+  - **Don't use HDMI on the Pi for the skull build** — there's a PipeWire/wireplumber restart bug on HDMI hotplug that kills USB audio mid-conversation.
+  - **Use the official Pi 5 PSU** (5V/5A). Undervoltage causes Jabra USB transfer failures.
+  - **Design implication**: with Jabra handling AEC in hardware, the software AEC + `STTMuteOnBotSpeech` cool-down become belt-and-braces, not primary defense. The skull is a visual prop; voice comes from the Jabra on the desk (jaw still syncs via `bot_audio` tap).
+
 ## Standard Commands
 
 - `uv run larry` — start main loop
@@ -50,9 +60,10 @@ macOS = dev, Pi 5 = production.
 
 ## API Keys
 
-- **OPENROUTER_API_KEY**: chat LLM (Claude Sonnet 4.6 by default) + Mem0 fact extraction (Claude Haiku 4.5). Single key for both via OpenRouter.
+- **XAI_API_KEY** *(optional, preferred)*: when set, the main chat LLM routes direct to xAI (`grok-4.20-non-reasoning` default — ~600ms TTFT, ~20× cheaper than Claude per May 2026 research). Falls back to OpenRouter if unset.
+- **OPENROUTER_API_KEY**: always required for Mem0 fact extraction (Claude Haiku 4.5). Also serves the main chat LLM if XAI_API_KEY is unset.
 - **GROQ_API_KEY**: Groq Whisper-large-v3-turbo (STT).
-- **ELEVENLABS_API_KEY**: ElevenLabs v3 (TTS).
+- **ELEVENLABS_API_KEY**: ElevenLabs `eleven_turbo_v2_5` (TTS, voice `cPoqAvGWCPfCfyPMwe4z`).
 
 Wake word runs locally via OpenWakeWord (Apache-2.0) — no API key required.
 
@@ -60,7 +71,7 @@ Embeddings (Mem0 vector layer) run locally via FastEmbed (BAAI/bge-small-en-v1.5
 
 ## Pipecat-Specific Gotchas
 
-- Default LLM model is `anthropic/claude-sonnet-4-6` routed via OpenRouter through `OpenAILLMService`. Override with `LLM_MODEL` env var.
+- Default LLM model depends on which provider is active: `grok-4.20-non-reasoning` via `GrokLLMService` when `XAI_API_KEY` is set (preferred path), else `anthropic/claude-sonnet-4-6` via `OpenAILLMService` + OpenRouter. Override with `LLM_MODEL` env var; model name semantics differ by provider (prefixed `x-ai/grok-...` for OpenRouter, plain `grok-4.20-non-reasoning` for direct xAI).
 - Proactive utterances (speak outside pipeline flow): `await task.queue_frame(TTSSpeakFrame("..."))`
 - User idle detection: `UserIdleProcessor` from `pipecat.processors.user_idle_processor` (NOT a transport hook).
 - Jaw sync: `AudioBufferProcessor` after TTS, register `@event_handler("on_track_audio_data")`, consume `bot_audio` (not `user_audio`).

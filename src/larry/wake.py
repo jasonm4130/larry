@@ -1,6 +1,7 @@
 """Wake-word gate: holds the pipeline asleep until the configured wake word is detected."""
 
 import struct
+from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
 
@@ -8,7 +9,13 @@ import numpy as np
 import openwakeword
 from loguru import logger
 from openwakeword.model import Model
-from pipecat.frames.frames import Frame, InputAudioRawFrame, SystemFrame
+from pipecat.frames.frames import (
+    Frame,
+    InputAudioRawFrame,
+    SystemFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 _SAMPLE_RATE = 16000
@@ -40,7 +47,7 @@ class WakeWordGate(FrameProcessor):
         model: Model,
         model_name: str,
         threshold: float = 0.5,
-        sleep_timeout_s: float = 30.0,
+        sleep_timeout_s: float = 10.0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -49,11 +56,30 @@ class WakeWordGate(FrameProcessor):
         self._threshold = threshold
         self._sleep_timeout_s = sleep_timeout_s
         self._awake: bool = False
+        # _speaking is True between VADUserStartedSpeakingFrame and
+        # VADUserStoppedSpeakingFrame.  We do NOT time out while speaking, no
+        # matter how long the user talks; the 10s clock only runs during
+        # post-speech silence (or immediately after wake-word with no speech yet).
+        self._speaking: bool = False
         self._last_voice_activity: float = 0.0
         self._pcm_buffer: list[int] = []
+        # Optional callbacks fired on state transitions so the rest of the
+        # pipeline can surface an audio "Yes?" / "Hmph." listening cue.
+        self.on_wake: Callable[[], None] | None = None
+        self.on_sleep: Callable[[], None] | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+
+        # VAD speaking-state tracking — VAD frames are SystemFrames so they
+        # reach us upstream even though VADProcessor sits downstream of us.
+        # We only care while awake; pre-wake speaking is irrelevant.
+        if self._awake and isinstance(frame, VADUserStartedSpeakingFrame):
+            self._speaking = True
+            self._last_voice_activity = monotonic()
+        elif self._awake and isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._speaking = False
+            self._last_voice_activity = monotonic()
 
         if isinstance(frame, InputAudioRawFrame):
             await self._handle_audio(frame, direction)
@@ -71,13 +97,20 @@ class WakeWordGate(FrameProcessor):
     async def _handle_audio(self, frame: InputAudioRawFrame, direction: FrameDirection) -> None:
         """Route audio based on wake state; feed asleep audio to OpenWakeWord."""
         if self._awake:
-            # Check sleep timeout on every audio frame — cheap monotonic compare.
-            if monotonic() - self._last_voice_activity > self._sleep_timeout_s:
+            # Timeout only fires during post-speech silence — never mid-sentence,
+            # never on raw-audio energy (HVAC, room tone never make audio all-zero
+            # so the old `any(frame.audio)` reset effectively disabled the
+            # timeout entirely).  Speaking state is tracked via VAD frames.
+            if (
+                not self._speaking
+                and monotonic() - self._last_voice_activity > self._sleep_timeout_s
+            ):
                 self._awake = False
+                self._speaking = False
                 logger.info("Larry going back to sleep (timeout).")
+                if self.on_sleep is not None:
+                    self.on_sleep()
             else:
-                if any(frame.audio):
-                    self._last_voice_activity = monotonic()
                 await self.push_frame(frame, direction)
             return
 
@@ -104,12 +137,15 @@ class WakeWordGate(FrameProcessor):
             score = scores.get(self._model_name, 0.0)
             if score >= self._threshold:
                 self._awake = True
+                self._speaking = False
                 self._last_voice_activity = monotonic()
                 logger.info(
                     "Larry awoken by wake word '{}' (score={:.3f}).",
                     self._model_name,
                     score,
                 )
+                if self.on_wake is not None:
+                    self.on_wake()
                 # Forward this frame so the immediately following speech isn't lost.
                 await self.push_frame(frame, direction)
                 return
@@ -118,7 +154,7 @@ class WakeWordGate(FrameProcessor):
 def make_wake_word_gate(
     model_name: str = "hey_jarvis",
     custom_model_path: str | None = None,
-    sleep_timeout_s: float = 30.0,
+    sleep_timeout_s: float = 10.0,
     threshold: float = 0.5,
 ) -> WakeWordGate:
     """Build a WakeWordGate backed by OpenWakeWord (Apache-2.0, no API key needed).
@@ -129,6 +165,7 @@ def make_wake_word_gate(
     """
     if custom_model_path is not None:
         model_path = custom_model_path
+        logger.info("Loading custom OpenWakeWord model from {}.", model_path)
     else:
         model_path = _resolve_pretrained_path(model_name)
         logger.info(

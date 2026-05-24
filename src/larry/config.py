@@ -13,7 +13,13 @@ class Config:
     # API keys
     openrouter_api_key: str
     openrouter_base_url: str  # default: https://openrouter.ai/api/v1
-    llm_model: str  # default: anthropic/claude-sonnet-4-6; override via LLM_MODEL
+    # If XAI_API_KEY is set, the main chat LLM routes directly to xAI's API
+    # (faster + cheaper than Claude via OpenRouter, per May 2026 research).
+    # Mem0's fact-extraction LLM still uses OpenRouter regardless.
+    xai_api_key: str | None
+    # Default depends on which provider is active: grok-4.20-non-reasoning for
+    # xAI direct, anthropic/claude-sonnet-4-6 for OpenRouter.  Override via LLM_MODEL.
+    llm_model: str
     groq_api_key: str
     elevenlabs_api_key: str
     elevenlabs_voice_id: str
@@ -57,10 +63,17 @@ def load_config() -> Config:
 
     data_dir = Path("data")
 
+    xai_api_key = os.environ.get("XAI_API_KEY")
+    # Default model depends on active provider — xAI's grok-4.20 non-reasoning
+    # variant is the fast/cheap pick when routing direct, Claude Sonnet 4.6
+    # remains the OpenRouter fallback.
+    default_llm = "grok-4.20-non-reasoning" if xai_api_key else "anthropic/claude-sonnet-4-6"
+
     return Config(
         openrouter_api_key=_require("OPENROUTER_API_KEY"),
         openrouter_base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-        llm_model=os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4-6"),
+        xai_api_key=xai_api_key,
+        llm_model=os.environ.get("LLM_MODEL", default_llm),
         groq_api_key=_require("GROQ_API_KEY"),
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),

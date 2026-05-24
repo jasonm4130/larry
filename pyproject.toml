@@ -15,6 +15,7 @@ dependencies = [
     "resemblyzer",
     "gpiozero",
     "fastembed",
+    "pywebrtc-audio>=0.1.0",
 ]
 
 [project.optional-dependencies]

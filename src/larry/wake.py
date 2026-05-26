@@ -108,6 +108,16 @@ class WakeWordGate(FrameProcessor):
             ):
                 self._awake = False
                 self._speaking = False
+                # Clear OpenWakeWord's 30-frame prediction_buffer.  We only
+                # populate it while asleep, so when we wake it freezes with
+                # whatever scores triggered the wake — necessarily ≥ threshold.
+                # Without this reset, the next post-sleep chunk lands on top of
+                # those stale highs and trivially satisfies patience=3, causing
+                # 8 ms sleep→wake bounces observed in production logs.  After
+                # reset, OWW's built-in 5-frame init guard auto-zeros the next
+                # ~400 ms of predictions, giving the preprocessor mel state
+                # time to refresh before patience can pass.
+                self._model.reset()
                 logger.info("Larry going back to sleep (timeout).")
                 if self.on_sleep is not None:
                     self.on_sleep()

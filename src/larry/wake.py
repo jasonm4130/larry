@@ -220,10 +220,13 @@ def make_wake_word_gate(
     model = Model(
         wakeword_model_paths=[model_path],
         # Silero VAD gate — zeros wake-word predictions whose 400-560ms
-        # surrounding window has VAD score < 0.5.  Kills the false-positive
-        # class we actually see in kitchen audio: HVAC drone, appliance
-        # clicks, distant non-speech.  ~2ms/frame Pi 5 cost.
-        vad_threshold=0.5,
+        # surrounding window has VAD score < 0.3.  Kills the false-positive
+        # class we actually see in kitchen audio (HVAC drone, appliance
+        # clicks, distant non-speech) while staying lenient enough to pass
+        # a normal "hey larry" said from across a desk.  ~2ms/frame Pi 5
+        # cost.  0.5 (the "aggressive noisy environment" setting) starved
+        # wake detection when combined with patience=3.
+        vad_threshold=0.3,
         enable_speex_noise_suppression=enable_speex,
     )
     # predict() returns a dict keyed by the .onnx filename stem (e.g. "hey_jarvis_v0.1").

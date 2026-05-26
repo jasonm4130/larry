@@ -25,6 +25,7 @@ import re
 import sys
 from pathlib import Path
 
+import httpx
 from loguru import logger as _loguru
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -34,7 +35,10 @@ from pipecat.frames.frames import (
     Frame,
     STTMuteFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
     TTSSpeakFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
 )
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
@@ -256,6 +260,40 @@ _SLEEP_CUES: list[str] = [
 ]
 
 
+async def _presynthesize_cues(
+    api_key: str,
+    voice_id: str,
+    model: str,
+    cues: list[str],
+) -> dict[str, bytes]:
+    """Render each cue once via ElevenLabs HTTP, return text → 24 kHz PCM bytes.
+
+    Used so wake/sleep cues skip the ~300–500 ms ElevenLabs WebSocket round
+    trip on every state change — Larry says "Yes." the instant you wake him.
+    Any cue that fails to render is omitted from the cache; ``_on_wake`` /
+    ``_on_sleep`` fall back to a live ``TTSSpeakFrame`` for missing entries.
+    """
+    cache: dict[str, bytes] = {}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for text in cues:
+            try:
+                r = await client.post(
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                    params={"output_format": "pcm_24000"},
+                    headers={"xi-api-key": api_key, "Accept": "audio/pcm"},
+                    json={"text": text, "model_id": model},
+                )
+                r.raise_for_status()
+                cache[text] = r.content
+            except httpx.HTTPError as e:
+                logger.warning(
+                    "Cue pre-synth failed for %r: %s — will fall back to live TTS",
+                    text,
+                    e,
+                )
+    return cache
+
+
 def _setup_logging(logs_dir: Path) -> None:
     """Configure stderr + rotating file logging for both stdlib and loguru.
 
@@ -379,12 +417,13 @@ async def run() -> None:
     # mic audio — EBU R128 normalisation puts conversational speech around
     # 0.05–0.3.  Drop it so the Silero confidence score is what gates speech.
     # ------------------------------------------------------------------
-    # stop_secs=0.3 trims ~200ms off the pause between user-stop and STT
-    # flushing audio to Groq.  Pipecat default is 0.2 already; this is
-    # explicit so we remember the lever exists.
+    # stop_secs is the silence window VAD waits before declaring the user's
+    # turn over.  0.2 shaves ~100ms vs 0.3 at the cost of being slightly
+    # quicker to declare end-of-turn during mid-sentence pauses.  Worth it
+    # for perceived latency; revisit if Larry starts interrupting people.
     vad_processor = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
-            params=VADParams(min_volume=0.1, stop_secs=0.3),
+            params=VADParams(min_volume=0.1, stop_secs=0.2),
         ),
     )
 
@@ -557,16 +596,46 @@ async def run() -> None:
     # Listening cue: short in-character word on wake / sleep so the
     # human knows whether Larry is currently listening.  Bound after
     # `task` exists so we can queue frames from the wake gate.
+    #
+    # Cues are pre-rendered once at boot via the ElevenLabs REST API and
+    # cached as PCM bytes — playing them back means injecting a
+    # TTSAudioRawFrame directly (no TTS round trip per wake/sleep).  The
+    # transport detects the audio and emits BotStarted/StoppedSpeaking
+    # automatically, which keeps STTMuteOnBotSpeech in sync.
     # ------------------------------------------------------------------
+    cue_audio: dict[str, bytes] = await _presynthesize_cues(
+        cfg.elevenlabs_api_key,
+        cfg.elevenlabs_voice_id,
+        cfg.elevenlabs_model,
+        list(dict.fromkeys(_WAKE_CUES + _SLEEP_CUES)),
+    )
+    logger.info(
+        "Pre-synth cue cache: %d/%d cues, %d bytes total",
+        len(cue_audio),
+        len(set(_WAKE_CUES + _SLEEP_CUES)),
+        sum(len(b) for b in cue_audio.values()),
+    )
+
+    async def _play_cue(line: str) -> None:
+        audio = cue_audio.get(line)
+        if audio is None:
+            await task.queue_frame(TTSSpeakFrame(text=line))
+            return
+        await task.queue_frames([
+            TTSStartedFrame(),
+            TTSAudioRawFrame(audio=audio, sample_rate=24000, num_channels=1),
+            TTSStoppedFrame(),
+        ])
+
     def _on_wake() -> None:
         line = random.choice(_WAKE_CUES)
         logger.info("Wake cue: %r", line)
-        asyncio.create_task(task.queue_frame(TTSSpeakFrame(text=line)))
+        asyncio.create_task(_play_cue(line))
 
     def _on_sleep() -> None:
         line = random.choice(_SLEEP_CUES)
         logger.info("Sleep cue: %r", line)
-        asyncio.create_task(task.queue_frame(TTSSpeakFrame(text=line)))
+        asyncio.create_task(_play_cue(line))
 
     wake_gate.on_wake = _on_wake
     wake_gate.on_sleep = _on_sleep

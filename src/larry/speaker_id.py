@@ -1,5 +1,6 @@
 """Speaker identification layer for Larry using Resemblyzer voice embeddings."""
 
+import asyncio
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -64,6 +65,7 @@ class SpeakerIDProcessor(FrameProcessor):
         self._encoder: VoiceEncoder = VoiceEncoder()  # blocks on torch load — fail fast
         self._audio_buffer: bytearray = bytearray()
         self._current_speaker: str = "unknown"
+        self._identify_task: asyncio.Task | None = None
 
         logger.info(
             f"SpeakerIDProcessor ready: {len(self._enrolled)} enrolled speaker(s), "
@@ -78,7 +80,17 @@ class SpeakerIDProcessor(FrameProcessor):
             if len(self._audio_buffer) >= self._window_bytes:
                 window = bytes(self._audio_buffer[: self._window_bytes])
                 del self._audio_buffer[: self._window_bytes]
-                self._identify_speaker(window)
+                # Fire-and-forget: Resemblyzer's torch embed is a 100-200ms
+                # CPU stall.  Running it inline blocks the whole pipeline
+                # (STT/LLM/TTS frames queue up behind us).  Skip new windows
+                # while a prior embed is still running — torch state isn't
+                # safe for concurrent calls, and "who is speaking right now"
+                # is fine to sample every couple seconds rather than every
+                # 1s window.
+                if self._identify_task is None or self._identify_task.done():
+                    self._identify_task = asyncio.create_task(
+                        asyncio.to_thread(self._identify_speaker, window)
+                    )
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TranscriptionFrame):

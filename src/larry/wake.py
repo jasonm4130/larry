@@ -133,8 +133,22 @@ class WakeWordGate(FrameProcessor):
             chunk = self._pcm_buffer[:_CHUNK_SAMPLES]
             self._pcm_buffer = self._pcm_buffer[_CHUNK_SAMPLES:]
             chunk_np = np.array(chunk, dtype=np.int16)
-            scores = self._model.predict(chunk_np)
-            score = scores.get(self._model_name, 0.0)
+            # patience=3 requires three consecutive 80 ms chunks (240 ms total)
+            # above threshold before predict() reports a hit.  Without it, a
+            # single spurious frame can wake — observed as 8-132 ms sleep→wake
+            # bounces when the model resumes scoring after a long awake period
+            # (we feed no audio while awake, so the preprocessor's mel buffer
+            # and the model's internal state are stale on the first post-sleep
+            # chunk and routinely cross 0.5 once).
+            scores = self._model.predict(
+                chunk_np,
+                patience={self._model_name: 3},
+                threshold={self._model_name: self._threshold},
+            )
+            # predict() returns dict[str, float] when timing=False (default);
+            # openwakeword's untyped signature unions that with the timing=True
+            # tuple shape, which pyright can't narrow without an overload.
+            score = scores.get(self._model_name, 0.0)  # type: ignore[reportAttributeAccessIssue]
             if score >= self._threshold:
                 self._awake = True
                 self._speaking = False

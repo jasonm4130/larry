@@ -18,6 +18,7 @@ Pipeline order:
 import asyncio
 import datetime
 import logging
+import logging.handlers
 import os
 import random
 import re
@@ -52,6 +53,7 @@ from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.xai.llm import GrokLLMService
+from pipecat.services.xai.stt import XAISTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 from pipecat.turns.user_mute import AlwaysUserMuteStrategy
 
@@ -61,6 +63,7 @@ from larry.hardware import get_jaw_driver
 from larry.jaw import JawAmplitudeMapper
 from larry.memory import ConversationLog, make_memory_service
 from larry.speaker_id import SpeakerIDProcessor
+from larry.stt_mute_fix import MutedGroqSTTService
 from larry.wake import make_wake_word_gate
 
 logger = logging.getLogger(__name__)
@@ -253,6 +256,56 @@ _SLEEP_CUES: list[str] = [
 ]
 
 
+def _setup_logging(logs_dir: Path) -> None:
+    """Configure stderr + rotating file logging for both stdlib and loguru.
+
+    Stderr stays so live tailing in the terminal still works.  Files give us
+    something to grep after the fact — last session diagnosed a Groq STT 429
+    burst from logs the user had to copy-paste 5,000 lines into chat.
+
+    Two separate files because the two logging systems don't share state:
+      - ``larry.log``   — stdlib (``larry.*``, ``httpx``, ``mem0.*``, ``openai._base_client``)
+      - ``pipecat.log`` — loguru (everything from Pipecat itself)
+
+    Rotation is by size (10 MB × 5 backups).  Compression on Pipecat side
+    because its DEBUG output is verbose enough that .gz/.zip is worth it.
+    """
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    level = logging.DEBUG if os.environ.get("LARRY_DEBUG") else logging.INFO
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    # Wipe any handlers basicConfig added so we can install ours cleanly.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(logging.Formatter(fmt))
+    root.addHandler(stderr_handler)
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        logs_dir / "larry.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter(fmt))
+    root.addHandler(file_handler)
+
+    _loguru.remove()
+    _loguru.add(sys.stderr, level="DEBUG" if os.environ.get("LARRY_DEBUG") else "INFO")
+    _loguru.add(
+        logs_dir / "pipecat.log",
+        level="DEBUG",  # always DEBUG to disk — file is rotated anyway
+        rotation="10 MB",
+        retention=5,
+        compression="zip",
+        enqueue=True,  # safe across the async tasks Pipecat spawns
+    )
+
+
 def _load_system_prompt(personality_path: Path) -> str:
     """Read the character card and append a time-of-day note."""
     card = personality_path.read_text()
@@ -275,17 +328,9 @@ def _load_system_prompt(personality_path: Path) -> str:
 
 async def run() -> None:
     """Run the voice loop. Talk to Larry; he talks back."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    # Surface VAD start/stop debug lines from Pipecat (loguru, separate from stdlib).
-    if os.environ.get("LARRY_DEBUG"):
-        _loguru.remove()
-        _loguru.add(sys.stderr, level="DEBUG")
-
     cfg = load_config()
-    logger.info("Larry waking up...")
+    _setup_logging(cfg.logs_dir)
+    logger.info("Larry waking up... (logs: %s)", cfg.logs_dir)
 
     # ------------------------------------------------------------------
     # Phase 5: jaw driver — initialise once, close on exit
@@ -373,22 +418,26 @@ async def run() -> None:
     # ------------------------------------------------------------------
     # STT / LLM / TTS
     # ------------------------------------------------------------------
-    # `prompt=` steers Whisper away from YouTube-style silence
-    # hallucinations ("Thanks for watching", "Subscribe").  Documented
-    # mitigation per the Jan-2025 arxiv 2501.11378 BoH paper.
-    # include_prob_metrics=True flips Groq into `verbose_json` mode so each
-    # TranscriptionFrame carries per-segment `no_speech_prob`, `avg_logprob`
-    # and `compression_ratio`.  `WhisperHallucinationFilter` reads those off
-    # `frame.result.segments` and drops silence-hallucinations at the source,
-    # before they ever reach the LLM.  Static denylist stays as a backstop.
-    stt = GroqSTTService(
-        api_key=cfg.groq_api_key,
-        settings=GroqSTTService.Settings(
-            model="whisper-large-v3-turbo",
-            prompt="Voice dictation transcript.",
-        ),
-        include_prob_metrics=True,
-    )
+    # STT path: xAI direct (streaming WebSocket) preferred — far lower
+    # hallucination rate than Whisper and correct mute behavior under
+    # STTMuteOnBotSpeech (xAI's WebsocketSTTService honors `_muted`, unlike
+    # Groq's SegmentedSTTService).  Falls back to Whisper via Groq when
+    # XAI_API_KEY is unset; that path uses MutedGroqSTTService + the
+    # WhisperHallucinationFilter (verbose_json per-segment drops + static
+    # denylist) to mitigate hallucinations at the source.
+    if cfg.xai_api_key:
+        logger.info("STT: xAI direct (streaming)")
+        stt = XAISTTService(api_key=cfg.xai_api_key)
+    else:
+        logger.info("STT: Groq Whisper-large-v3-turbo (fallback)")
+        stt = MutedGroqSTTService(
+            api_key=cfg.groq_api_key,
+            settings=GroqSTTService.Settings(
+                model="whisper-large-v3-turbo",
+                prompt="Voice dictation transcript.",
+            ),
+            include_prob_metrics=True,
+        )
     # temperature=0.7 (down from default 1.0) modestly reduces persona
     # drift / off-topic riffing per Anthropic's "Assistant Axis" findings.
     # If XAI_API_KEY is set, route the main LLM directly to xAI (lower latency

@@ -35,6 +35,7 @@ class Config:
     speakers_db: Path
     conversations_db: Path
     mem0_dir: Path
+    logs_dir: Path
     personality_path: Path
 
     # Servo calibration
@@ -85,6 +86,7 @@ def load_config() -> Config:
         speakers_db=data_dir / "speakers.db",
         conversations_db=data_dir / "conversations.db",
         mem0_dir=data_dir / "mem0",
+        logs_dir=data_dir / "logs",
         personality_path=Path(__file__).parent / "personality" / "larry.md",
         jaw_open_angle=60,
         jaw_closed_angle=0,

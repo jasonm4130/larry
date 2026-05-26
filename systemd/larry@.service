@@ -1,0 +1,39 @@
+# Larry systemd unit — Pi deploy (templated by username)
+#
+# Install (replace `jason` with the username running Larry):
+#   sudo cp systemd/larry@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable larry@jason
+#   sudo systemctl start larry@jason
+#
+# Logs:
+#   journalctl -u larry@jason -f
+#
+# `%i` expands to the instance name (whatever follows `@`).  Assumes:
+#   - $HOME = /home/%i
+#   - uv installed at /home/%i/.local/bin/uv  (default curl-installer path)
+#   - repo cloned to /home/%i/larry
+
+[Unit]
+Description=Larry — cursed AI Halloween skull (user=%i)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+User=%i
+Group=%i
+SupplementaryGroups=gpio i2c audio
+
+WorkingDirectory=/home/%i/larry
+
+Environment=GPIOZERO_PIN_FACTORY=lgpio
+Environment=LARRY_HARDWARE=pca9685
+EnvironmentFile=/home/%i/larry/.env
+
+ExecStart=/home/%i/.local/bin/uv run larry
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

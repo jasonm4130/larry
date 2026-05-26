@@ -1,5 +1,6 @@
 """Wake-word gate: holds the pipeline asleep until the configured wake word is detected."""
 
+import importlib.util
 import struct
 from collections.abc import Callable
 from pathlib import Path
@@ -190,7 +191,31 @@ def make_wake_word_gate(
             model_path,
         )
 
-    model = Model(wakeword_model_paths=[model_path])
+    # Speex DSP noise suppression is a Pi-only optional dep — the wheel
+    # ships from openWakeWord's GitHub releases, not PyPI, and is Linux/
+    # aarch64 only.  Feature-detect so macOS dev keeps working: if the
+    # wheel isn't installed, silently fall back to no NS at this layer
+    # (Pipecat's WebRTC NS in audio_filter.py is still running upstream).
+    if importlib.util.find_spec("speexdsp_ns") is not None:
+        enable_speex = True
+        logger.info("Wake gate: Speex noise suppression enabled.")
+    else:
+        enable_speex = False
+        logger.info(
+            "Wake gate: Speex NS disabled (speexdsp_ns not installed). "
+            "On Pi: `sudo apt install libspeexdsp-dev` then install the "
+            "speexdsp-ns wheel from openwakeword's release assets."
+        )
+
+    model = Model(
+        wakeword_model_paths=[model_path],
+        # Silero VAD gate — zeros wake-word predictions whose 400-560ms
+        # surrounding window has VAD score < 0.5.  Kills the false-positive
+        # class we actually see in kitchen audio: HVAC drone, appliance
+        # clicks, distant non-speech.  ~2ms/frame Pi 5 cost.
+        vad_threshold=0.5,
+        enable_speex_noise_suppression=enable_speex,
+    )
     # predict() returns a dict keyed by the .onnx filename stem (e.g. "hey_jarvis_v0.1").
     score_key = Path(model_path).stem
 

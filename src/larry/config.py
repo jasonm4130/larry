@@ -30,6 +30,13 @@ class Config:
     wake_word_model: str  # OpenWakeWord pretrained model name (default: hey_jarvis)
     wake_word_custom_path: str | None  # path to a custom .onnx model, if any
 
+    # Turn-taking / VAD tuning (see docs/plan: turn-taking robustness)
+    stt_mute_cooldown_s: float  # STT stays muted this long after bot stops speaking
+    vad_start_secs: float  # speech must persist this long before VAD declares a turn start
+    wake_sleep_timeout_s: float  # post-speech silence before the wake gate sleeps
+    enable_smart_turn: bool  # layer Smart Turn v3 neural end-of-turn on top of VAD
+    smart_turn_cpu_count: int  # threads for the local Smart Turn ONNX model
+
     # Paths
     data_dir: Path
     speakers_db: Path
@@ -64,6 +71,17 @@ def load_config() -> Config:
 
     data_dir = Path("data")
 
+    def _bool(key: str, default: bool) -> bool:
+        val = os.environ.get(key)
+        if val is None:
+            return default
+        return val.strip().lower() in {"1", "true", "yes", "on"}
+
+    larry_hardware = os.environ.get("LARRY_HARDWARE", _default_hardware())
+    # Smart Turn defaults on for the Pi (pca9685 + Jabra hardware AEC), off for
+    # Mac dev where it adds latency to a feedback-prone single-device loop.
+    smart_turn_default = larry_hardware == "pca9685"
+
     xai_api_key = os.environ.get("XAI_API_KEY")
     # Default model depends on active provider — xAI's grok-4.20 non-reasoning
     # variant is the fast/cheap pick when routing direct, Claude Sonnet 4.6
@@ -79,9 +97,14 @@ def load_config() -> Config:
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),
         elevenlabs_model=os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
-        larry_hardware=os.environ.get("LARRY_HARDWARE", _default_hardware()),
+        larry_hardware=larry_hardware,
         wake_word_model=os.environ.get("WAKE_WORD_MODEL", "hey_jarvis"),
         wake_word_custom_path=os.environ.get("WAKE_WORD_CUSTOM_PATH"),
+        stt_mute_cooldown_s=float(os.environ.get("STT_MUTE_COOLDOWN_S", "0.2")),
+        vad_start_secs=float(os.environ.get("VAD_START_SECS", "0.1")),
+        wake_sleep_timeout_s=float(os.environ.get("WAKE_SLEEP_TIMEOUT_S", "20")),
+        enable_smart_turn=_bool("ENABLE_SMART_TURN", smart_turn_default),
+        smart_turn_cpu_count=int(os.environ.get("SMART_TURN_CPU_COUNT", "2")),
         data_dir=data_dir,
         speakers_db=data_dir / "speakers.db",
         conversations_db=data_dir / "conversations.db",

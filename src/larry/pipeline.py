@@ -59,7 +59,12 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.xai.llm import GrokLLMService
 from pipecat.services.xai.stt import XAISTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
-from pipecat.turns.user_mute import AlwaysUserMuteStrategy
+from pipecat.turns.user_mute import AlwaysUserMuteStrategy, BaseUserMuteStrategy
+from pipecat.turns.user_stop import (
+    SpeechTimeoutUserTurnStopStrategy,
+    TurnAnalyzerUserTurnStopStrategy,
+)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
@@ -405,6 +410,7 @@ async def run() -> None:
     wake_gate = make_wake_word_gate(
         model_name=cfg.wake_word_model,
         custom_model_path=cfg.wake_word_custom_path,
+        sleep_timeout_s=cfg.wake_sleep_timeout_s,
     )
 
     # ------------------------------------------------------------------
@@ -421,10 +427,21 @@ async def run() -> None:
     # turn over.  0.2 shaves ~100ms vs 0.3 at the cost of being slightly
     # quicker to declare end-of-turn during mid-sentence pauses.  Worth it
     # for perceived latency; revisit if Larry starts interrupting people.
+    #
+    # start_secs is how long speech must persist before VAD declares a turn
+    # *start*.  Pipecat's 0.2 default silently drops short replies ("ok",
+    # "yes", "no") — the maintainer's documented fix is 0.1-0.15 (issue #984).
+    # Kept low here because Smart Turn v3 below decides actual end-of-turn, so
+    # an aggressive start_secs doesn't translate into false interruptions.
+    # stop_secs must stay 0.2 — Smart Turn v3 requires it as its base window.
+    #
+    # One VADParams instance, shared by the front-end VADProcessor and the
+    # aggregator's analyzer below, so the two never drift (the aggregator used
+    # to construct a bare SileroVADAnalyzer() with strict 0.6/0.7 defaults that
+    # re-rejected normal-volume desk audio the front VAD had already accepted).
+    vad_params = VADParams(min_volume=0.1, stop_secs=0.2, start_secs=cfg.vad_start_secs)
     vad_processor = VADProcessor(
-        vad_analyzer=SileroVADAnalyzer(
-            params=VADParams(min_volume=0.1, stop_secs=0.2),
-        ),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params),
     )
 
     # ------------------------------------------------------------------
@@ -517,17 +534,58 @@ async def run() -> None:
     # ------------------------------------------------------------------
     system_prompt = _load_system_prompt(cfg.personality_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
-    # AlwaysUserMuteStrategy suppresses VAD / transcription / interruption
-    # frames while the bot is speaking.  On a Mac dev setup the mic and
-    # speaker share a device, so any barge-in strategy mistakes Larry's
-    # own voice for the user.  Revisit on the Pi where the desk mic is
-    # physically separated from the speaker.
+
+    # Barge-in / mute policy.  AlwaysUserMuteStrategy suppresses VAD /
+    # transcription / interruption frames while the bot is speaking — needed on
+    # Mac dev where the mic and speaker share one device (Larry hears himself),
+    # but on the Pi the Jabra Speak 510's hardware AEC removes the echo, so we
+    # drop the strategy there to enable barge-in (talk over Larry → he yields).
+    # STTMuteOnBotSpeech still guards against self-transcription during active
+    # bot speech on both platforms; only its short post-speech cool-down trails.
+    on_pi = cfg.larry_hardware == "pca9685"
+    user_mute_strategies: list[BaseUserMuteStrategy] = (
+        [] if on_pi else [AlwaysUserMuteStrategy()]
+    )
+    logger.info(
+        "Barge-in %s (hardware=%s); AlwaysUserMuteStrategy %s",
+        "enabled" if on_pi else "disabled",
+        cfg.larry_hardware,
+        "off" if on_pi else "on",
+    )
+
+    # End-of-turn detection.  Pipecat 1.2.1's default stop strategy is already
+    # Smart Turn v3 (TurnAnalyzerUserTurnStopStrategy + LocalSmartTurnAnalyzerV3)
+    # — it runs whether or not we name it.  We make it explicit so cpu_count is
+    # tunable for the Pi 5 and so it can be swapped out: when disabled we fall
+    # back to pure VAD/STT-timeout endpointing (no neural model), which is the
+    # A/B baseline if Smart Turn is suspected of holding turns open in noise.
+    # start strategies are left to the aggregator default (VAD + transcription).
+    if cfg.enable_smart_turn:
+        from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+
+        user_turn_strategies = UserTurnStrategies(
+            stop=[
+                TurnAnalyzerUserTurnStopStrategy(
+                    turn_analyzer=LocalSmartTurnAnalyzerV3(cpu_count=cfg.smart_turn_cpu_count),
+                ),
+            ],
+        )
+        logger.info("End-of-turn: Smart Turn v3 (cpu_count=%d)", cfg.smart_turn_cpu_count)
+    else:
+        user_turn_strategies = UserTurnStrategies(
+            stop=[SpeechTimeoutUserTurnStopStrategy()],
+        )
+        logger.info("End-of-turn: VAD/STT-timeout only (Smart Turn disabled)")
+
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            # Share the tuned VADParams with the front-end VADProcessor so the
+            # two analyzers agree on what counts as speech.
+            vad_analyzer=SileroVADAnalyzer(params=vad_params),
             user_idle_timeout=cfg.idle_timeout_s,
-            user_mute_strategies=[AlwaysUserMuteStrategy()],
+            user_mute_strategies=user_mute_strategies,
+            user_turn_strategies=user_turn_strategies,
         ),
     )
     user_agg = aggregators.user()
@@ -553,7 +611,7 @@ async def run() -> None:
         transport.input(),
         wake_gate,
         vad_processor,
-        STTMuteOnBotSpeech(cool_down_s=1.0),
+        STTMuteOnBotSpeech(cool_down_s=cfg.stt_mute_cooldown_s),
         speaker_id,
         stt,
         WhisperHallucinationFilter(),

@@ -29,6 +29,7 @@ pi = [
 [dependency-groups]
 dev = [
     "pytest",
+    "pytest-cov",
     "ruff",
     "pyright",
     "pre-commit",
@@ -62,4 +63,12 @@ include = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra --cov=larry --cov-report=term-missing"
+
+[tool.coverage.run]
+# Drivers / entrypoint / CLI are integration-only; exclude from the core-logic number.
+omit = [
+    "*/larry/__main__.py",
+    "*/larry/cli/*",
+    "*/larry/hardware/jaw_pca9685.py",
+]

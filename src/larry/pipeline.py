@@ -363,9 +363,7 @@ def _load_system_prompt(personality_path: Path) -> str:
     elif hour < 18:
         tod = "It is late afternoon. The pretense of patience drops."
     else:
-        tod = (
-            "It is evening. The office is empty. You are still on. You note this."
-        )
+        tod = "It is evening. The office is empty. You are still on. You note this."
     return f"{card}\n\n## Current Context\n\n{tod}\n"
 
 
@@ -543,9 +541,7 @@ async def run() -> None:
     # STTMuteOnBotSpeech still guards against self-transcription during active
     # bot speech on both platforms; only its short post-speech cool-down trails.
     on_pi = cfg.larry_hardware == "pca9685"
-    user_mute_strategies: list[BaseUserMuteStrategy] = (
-        [] if on_pi else [AlwaysUserMuteStrategy()]
-    )
+    user_mute_strategies: list[BaseUserMuteStrategy] = [] if on_pi else [AlwaysUserMuteStrategy()]
     logger.info(
         "Barge-in %s (hardware=%s); AlwaysUserMuteStrategy %s",
         "enabled" if on_pi else "disabled",
@@ -607,22 +603,24 @@ async def run() -> None:
     # downstream audio processors).  The aggregator consumes LLMTextFrames
     # to build the assistant turn for context; if placed before TTS it
     # swallows them and TTS gets nothing to speak.
-    pipeline = Pipeline([
-        transport.input(),
-        wake_gate,
-        vad_processor,
-        STTMuteOnBotSpeech(cool_down_s=cfg.stt_mute_cooldown_s),
-        speaker_id,
-        stt,
-        WhisperHallucinationFilter(),
-        user_agg,
-        mem0_service,
-        llm,
-        tts,
-        audio_buffer,
-        transport.output(),
-        assistant_agg,
-    ])
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            wake_gate,
+            vad_processor,
+            STTMuteOnBotSpeech(cool_down_s=cfg.stt_mute_cooldown_s),
+            speaker_id,
+            stt,
+            WhisperHallucinationFilter(),
+            user_agg,
+            mem0_service,
+            llm,
+            tts,
+            audio_buffer,
+            transport.output(),
+            assistant_agg,
+        ]
+    )
 
     task = PipelineTask(
         pipeline,
@@ -679,11 +677,13 @@ async def run() -> None:
         if audio is None:
             await task.queue_frame(TTSSpeakFrame(text=line))
             return
-        await task.queue_frames([
-            TTSStartedFrame(),
-            TTSAudioRawFrame(audio=audio, sample_rate=24000, num_channels=1),
-            TTSStoppedFrame(),
-        ])
+        await task.queue_frames(
+            [
+                TTSStartedFrame(),
+                TTSAudioRawFrame(audio=audio, sample_rate=24000, num_channels=1),
+                TTSStoppedFrame(),
+            ]
+        )
 
     def _on_wake() -> None:
         line = random.choice(_WAKE_CUES)
@@ -732,8 +732,14 @@ async def run() -> None:
         # Grab the last user message from context to capture what was said.
         messages = context.get_messages()
         for msg in reversed(messages):
-            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
-                _pending["user_text"] = msg["content"]
+            # context.get_messages() returns a mix of dict-style standard
+            # messages and pipecat LLMSpecificMessage dataclasses; only the
+            # former support .get()/__getitem__, so skip the rest.
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if msg.get("role") == "user" and isinstance(content, str):
+                _pending["user_text"] = content
                 break
         _pending["speaker"] = speaker_id._current_speaker  # type: ignore[attr-defined]
 

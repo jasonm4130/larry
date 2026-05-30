@@ -103,7 +103,7 @@ class SpeakerIDProcessor(FrameProcessor):
     def _identify_speaker(self, pcm_window: bytes) -> None:
         """Embed one window of audio and update _current_speaker."""
         audio = pcm16_to_float32(pcm_window)
-        embedding = self._encoder.embed_utterance(audio)
+        embedding = np.asarray(self._encoder.embed_utterance(audio))
 
         if not self._enrolled:
             return

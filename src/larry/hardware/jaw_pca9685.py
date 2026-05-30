@@ -5,7 +5,7 @@ the Pi (`uv sync --extra pi`). The hardware factory in `larry.hardware.__init__`
 must never import this module on macOS.
 """
 
-from adafruit_servokit import ServoKit
+from adafruit_servokit import ServoKit  # pyright: ignore[reportMissingImports]
 
 
 class PCA9685JawDriver:

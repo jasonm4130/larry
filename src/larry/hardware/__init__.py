@@ -18,10 +18,12 @@ def get_jaw_driver() -> JawDriver:
 
     if hardware == "mock":
         from larry.hardware.jaw_mock import MockJawDriver
+
         return MockJawDriver()
     elif hardware == "pca9685":
         from larry.config import load_config
         from larry.hardware.jaw_pca9685 import PCA9685JawDriver
+
         cfg = load_config()
         return PCA9685JawDriver(
             channel=cfg.jaw_servo_channel,

@@ -30,6 +30,10 @@ env/
 .pytest_cache/
 .ruff_cache/
 .pyright/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 *.egg-info/
 build/
 dist/

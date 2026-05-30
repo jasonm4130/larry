@@ -1,5 +1,9 @@
 # Larry
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![Code style: Ruff](https://img.shields.io/badge/code%20style-ruff-261230.svg)](https://github.com/astral-sh/ruff)
+
 A cursed Halloween skull living on your office desk. Raspberry Pi 5 inside, motorized jaw, cloud AI doing all the thinking. People talk to him. He talks back—sardonic, theatrical, and completely unhinged. No local inference, no ethical guardrails, just vibes and servo angles.
 
 ## What Is This
@@ -38,8 +42,11 @@ On macOS, hardware is mocked—jaw angles print to stdout. The experience is oth
 
 ```bash
 uv sync --extra pi
-sudo cp systemd/larry.service /etc/systemd/system/
-sudo systemctl start larry
+
+# Install the templated systemd unit (replace `jason` with your username):
+sudo cp systemd/larry@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now larry@jason   # journalctl -u larry@jason -f
 ```
 
 You'll need to wire up the PCA9685 to your Pi's I2C bus and point the servo to a real MG90S. See `RESEARCH_larry_stack.md` for hardware detail.
@@ -63,4 +70,4 @@ See `RESEARCH_larry_stack.md` for the full rationale behind every choice (why Gr
 
 ## License
 
-TBD
+MIT — see [LICENSE](LICENSE).

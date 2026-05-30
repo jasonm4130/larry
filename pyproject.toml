@@ -1,6 +1,6 @@
 [project]
 name = "larry"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Cursed AI character in a Halloween skull on a Raspberry Pi 5."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -39,6 +39,9 @@ larry = "larry.__main__:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/larry/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/larry"]

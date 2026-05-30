@@ -15,6 +15,9 @@
 # Runtime data — speaker embeddings, Mem0 store, conversation log
 /data/
 
+# Session handoff docs — local, ephemeral
+/.claude/handoffs/
+
 # Python
 __pycache__/
 *.py[cod]

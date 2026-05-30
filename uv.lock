@@ -1182,7 +1182,6 @@ wheels = [
 
 [[package]]
 name = "larry"
-version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "fastembed" },
@@ -1221,7 +1220,7 @@ requires-dist = [
     { name = "lgpio", marker = "extra == 'pi'" },
     { name = "numpy" },
     { name = "openwakeword" },
-    { name = "pipecat-ai", extras = ["anthropic", "elevenlabs", "groq", "silero", "mem0", "local"], specifier = ">=0.0.108" },
+    { name = "pipecat-ai", extras = ["anthropic", "elevenlabs", "groq", "local", "mem0", "silero"], specifier = ">=0.0.108" },
     { name = "python-dotenv" },
     { name = "pywebrtc-audio", specifier = ">=0.1.0" },
     { name = "resemblyzer" },

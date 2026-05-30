@@ -1,5 +1,6 @@
 # Larry
 
+[![CI](https://github.com/jasonm4130/larry/actions/workflows/ci.yml/badge.svg)](https://github.com/jasonm4130/larry/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![Code style: Ruff](https://img.shields.io/badge/code%20style-ruff-261230.svg)](https://github.com/astral-sh/ruff)
@@ -59,6 +60,16 @@ Larry's voice, tone, and character live in `src/larry/personality/larry.md`. Edi
 
 - **Recurring:** ~$7/month in cloud API calls (at typical office chatting volume)
 - **One-time:** ~$170 in hardware (Pi, servo, driver board, mic, speaker)
+
+## Development
+
+```bash
+uv sync                      # installs dev tools (ruff, pyright, pytest, pre-commit)
+uv run pre-commit install    # lint + format on every commit
+uv run ruff check && uv run pyright && uv run pytest
+```
+
+CI (GitHub Actions) runs the same gates on every push and PR.
 
 ## Status
 

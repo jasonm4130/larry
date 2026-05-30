@@ -141,7 +141,7 @@ Example:
 - **OpenRouter as primary brain**: Text-only, no streaming audio, plus 100% markup on Claude
 - **Character.AI / Inworld / Convai**: Less direct control, more vendor lock-in, no meaningful persona advantage
 
-**Sources:** 
+**Sources:**
 - github.com/ning-coeva/continuity-bench
 - arXiv 2511.08565, 2601.22812, 2602.00016
 - dev.to/kiro0x FIVE article (May 2026)
@@ -165,7 +165,7 @@ Why ElevenLabs:
 - **PlayHT, Resemble, Inworld**: No compelling tooling for "cursed Victorian demon" out of the box
 - **Local TTS (TacotronX, Glow-TTS)**: User constraint: no local inference
 
-**Sources:** 
+**Sources:**
 - elevenlabs.io voice library
 - texttolab.com Cartesia vs ElevenLabs comparison (May 2026)
 - github.com/pipecat-ai/pipecat (ElevenLabs plugin docs)

@@ -89,7 +89,7 @@ Both encoded in `personality/larry.md` as strength-5 (triple-nested) negative co
 
 When spanning multiple independent files, dispatch parallel sub-agents (one per file or module). Orchestrator stays focused on integration and verification; subagents do file-level writing. Preserves context window across long sessions.
 
-Don't read `RESEARCH_larry_stack.md` by default — reference only. Consult when making stack-level decisions.
+Don't read `docs/RESEARCH_larry_stack.md` by default — reference only. Consult when making stack-level decisions.
 
 ## Out of Scope
 

@@ -82,6 +82,13 @@ Pipecat has no first-party Porcupine plugin (open issue #1985); we implement a c
 
 **Sources:** picovoice.ai/docs; github.com/Picovoice/porcupine
 
+> **🔄 Decision changed (May 2026) — shipped OpenWakeWord, not Porcupine.**
+> The "no account needed" constraint won out: OpenWakeWord (Apache-2.0) runs fully
+> local with zero API key or console signup, which suits a self-hosted desk toy better
+> than Porcupine's per-device keyed free tier. Default model `hey_jarvis`; a custom
+> "Hey Larry" `.onnx` (trained via the patched 2026 Colab) drops in via
+> `WAKE_WORD_CUSTOM_PATH`. Implemented as a custom `FrameProcessor` in `src/larry/wake.py`.
+
 ---
 
 ## Speech-to-Text: Groq Whisper-large-v3-turbo
@@ -147,6 +154,16 @@ Example:
 - dev.to/kiro0x FIVE article (May 2026)
 - Anthropic prompt caching docs (pipecat's default model is `claude-sonnet-4-6`)
 
+> **🔄 Decision changed (May 2026) — Grok is now the default brain, Claude the fallback.**
+> A follow-up cost/latency pass flipped the *default* path again: xAI's
+> `grok-4.20-non-reasoning` routes **direct to api.x.ai** at ~600ms TTFT and ~20× cheaper
+> per token than Claude-via-OpenRouter. So when `XAI_API_KEY` is set the main chat LLM
+> uses Grok direct; otherwise it falls back to `anthropic/claude-sonnet-4-6` via OpenRouter.
+> The persona-robustness argument above still holds — it's why Claude remains the fallback
+> and why edginess stays engineered via prompt + audio tags rather than model permissiveness.
+> Mem0's fact-extraction LLM uses OpenRouter (Claude Haiku 4.5) regardless. Override either
+> via `LLM_MODEL`.
+
 ---
 
 ## Text-to-Speech: ElevenLabs v3
@@ -169,6 +186,13 @@ Why ElevenLabs:
 - elevenlabs.io voice library
 - texttolab.com Cartesia vs ElevenLabs comparison (May 2026)
 - github.com/pipecat-ai/pipecat (ElevenLabs plugin docs)
+
+> **🔄 Decision changed (May 2026) — default model is `eleven_turbo_v2_5`, not `eleven_v3`.**
+> `eleven_v3` is the one that actually *performs* the `[cackle]`/`[whispers]` audio tags,
+> but it requires alpha access and dropped WebSocket support (TTFB ~10× worse over HTTP).
+> Larry therefore ships `eleven_turbo_v2_5` as the default (fast, works on the free tier),
+> with the model selectable via `ELEVENLABS_MODEL` for anyone with v3 alpha access. The
+> stock villain voice ID `cPoqAvGWCPfCfyPMwe4z` is unchanged.
 
 ---
 

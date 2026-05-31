@@ -38,7 +38,7 @@ def main(name: str) -> None:
     wav = audio.squeeze()
 
     encoder = VoiceEncoder()
-    embedding: np.ndarray = encoder.embed_utterance(wav)
+    embedding: np.ndarray = np.asarray(encoder.embed_utterance(wav))
 
     cfg = load_config()
     cfg.data_dir.mkdir(parents=True, exist_ok=True)

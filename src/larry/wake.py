@@ -11,6 +11,8 @@ import openwakeword
 from loguru import logger
 from openwakeword.model import Model
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     Frame,
     InputAudioRawFrame,
     SystemFrame,
@@ -62,6 +64,14 @@ class WakeWordGate(FrameProcessor):
         # matter how long the user talks; the 10s clock only runs during
         # post-speech silence (or immediately after wake-word with no speech yet).
         self._speaking: bool = False
+        # _bot_speaking is True between BotStartedSpeakingFrame and
+        # BotStoppedSpeakingFrame (Larry's own TTS).  The sleep clock must not
+        # run while Larry is talking — user VAD is muted during bot speech, so
+        # without this a reply longer than sleep_timeout_s puts Larry to sleep
+        # mid-monologue and the user's next turn hits a sleeping gate.  Bot
+        # speaking frames are SystemFrames the transport pushes upstream, so
+        # they reach this gate even though the transport output is downstream.
+        self._bot_speaking: bool = False
         self._last_voice_activity: float = 0.0
         self._pcm_buffer: list[int] = []
         # Optional callbacks fired on state transitions so the rest of the
@@ -80,6 +90,14 @@ class WakeWordGate(FrameProcessor):
             self._last_voice_activity = monotonic()
         elif self._awake and isinstance(frame, VADUserStoppedSpeakingFrame):
             self._speaking = False
+            self._last_voice_activity = monotonic()
+        elif self._awake and isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+        elif self._awake and isinstance(frame, BotStoppedSpeakingFrame):
+            # Restart the sleep clock when Larry finishes so the user gets a
+            # full timeout window to reply, measured from when Larry stops
+            # rather than from when the user last spoke.
+            self._bot_speaking = False
             self._last_voice_activity = monotonic()
 
         if isinstance(frame, InputAudioRawFrame):
@@ -104,10 +122,12 @@ class WakeWordGate(FrameProcessor):
             # timeout entirely).  Speaking state is tracked via VAD frames.
             if (
                 not self._speaking
+                and not self._bot_speaking
                 and monotonic() - self._last_voice_activity > self._sleep_timeout_s
             ):
                 self._awake = False
                 self._speaking = False
+                self._bot_speaking = False
                 # Clear OpenWakeWord's 30-frame prediction_buffer.  We only
                 # populate it while asleep, so when we wake it freezes with
                 # whatever scores triggered the wake — necessarily ≥ threshold.
@@ -163,6 +183,7 @@ class WakeWordGate(FrameProcessor):
             if score >= self._threshold:
                 self._awake = True
                 self._speaking = False
+                self._bot_speaking = False
                 self._last_voice_activity = monotonic()
                 logger.info(
                     "Larry awoken by wake word '{}' (score={:.3f}).",
@@ -179,7 +200,7 @@ class WakeWordGate(FrameProcessor):
 def make_wake_word_gate(
     model_name: str = "hey_jarvis",
     custom_model_path: str | None = None,
-    sleep_timeout_s: float = 10.0,
+    sleep_timeout_s: float = 20.0,
     threshold: float = 0.5,
 ) -> WakeWordGate:
     """Build a WakeWordGate backed by OpenWakeWord (Apache-2.0, no API key needed).

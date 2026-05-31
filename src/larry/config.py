@@ -30,6 +30,13 @@ class Config:
     wake_word_model: str  # OpenWakeWord pretrained model name (default: hey_jarvis)
     wake_word_custom_path: str | None  # path to a custom .onnx model, if any
 
+    # Turn-taking / VAD tuning (see docs/plan: turn-taking robustness)
+    stt_mute_cooldown_s: float  # STT stays muted this long after bot stops speaking
+    vad_start_secs: float  # speech must persist this long before VAD declares a turn start
+    wake_sleep_timeout_s: float  # post-speech silence before the wake gate sleeps
+    enable_smart_turn: bool  # layer Smart Turn v3 neural end-of-turn on top of VAD
+    smart_turn_cpu_count: int  # threads for the local Smart Turn ONNX model
+
     # Paths
     data_dir: Path
     speakers_db: Path
@@ -51,6 +58,63 @@ class Config:
     idle_timeout_s: float  # seconds of user silence before proactive utterance fires
     proactive_probability: float  # probability [0, 1] of speaking on each idle trigger
 
+    def __post_init__(self) -> None:
+        def _check(cond: bool, name: str, val: object, msg: str) -> None:
+            if not cond:
+                raise ValueError(f"{name} {msg}, got {val!r}")
+
+        _check(
+            0.0 <= self.proactive_probability <= 1.0,
+            "proactive_probability",
+            self.proactive_probability,
+            "must be in [0, 1]",
+        )
+        _check(
+            0 <= self.jaw_open_angle <= 180,
+            "jaw_open_angle",
+            self.jaw_open_angle,
+            "must be in [0, 180]",
+        )
+        _check(
+            0 <= self.jaw_closed_angle <= 180,
+            "jaw_closed_angle",
+            self.jaw_closed_angle,
+            "must be in [0, 180]",
+        )
+        _check(
+            0 <= self.jaw_servo_channel <= 15,
+            "jaw_servo_channel",
+            self.jaw_servo_channel,
+            "must be in [0, 15]",
+        )
+        _check(self.idle_timeout_s > 0, "idle_timeout_s", self.idle_timeout_s, "must be > 0")
+        _check(
+            self.wake_sleep_timeout_s > 0,
+            "wake_sleep_timeout_s",
+            self.wake_sleep_timeout_s,
+            "must be > 0",
+        )
+        _check(
+            self.stt_mute_cooldown_s >= 0,
+            "stt_mute_cooldown_s",
+            self.stt_mute_cooldown_s,
+            "must be >= 0",
+        )
+        _check(self.vad_start_secs >= 0, "vad_start_secs", self.vad_start_secs, "must be >= 0")
+        _check(
+            self.smart_turn_cpu_count >= 1,
+            "smart_turn_cpu_count",
+            self.smart_turn_cpu_count,
+            "must be >= 1",
+        )
+        _check(self.jaw_noise_floor >= 0, "jaw_noise_floor", self.jaw_noise_floor, "must be >= 0")
+        _check(
+            self.jaw_peak > self.jaw_noise_floor,
+            "jaw_peak",
+            self.jaw_peak,
+            f"must be > jaw_noise_floor ({self.jaw_noise_floor!r})",
+        )
+
 
 def load_config() -> Config:
     def _require(key: str) -> str:
@@ -63,6 +127,17 @@ def load_config() -> Config:
         return val
 
     data_dir = Path("data")
+
+    def _bool(key: str, default: bool) -> bool:
+        val = os.environ.get(key)
+        if val is None:
+            return default
+        return val.strip().lower() in {"1", "true", "yes", "on"}
+
+    larry_hardware = os.environ.get("LARRY_HARDWARE", _default_hardware())
+    # Smart Turn defaults on for the Pi (pca9685 + Jabra hardware AEC), off for
+    # Mac dev where it adds latency to a feedback-prone single-device loop.
+    smart_turn_default = larry_hardware == "pca9685"
 
     xai_api_key = os.environ.get("XAI_API_KEY")
     # Default model depends on active provider — xAI's grok-4.20 non-reasoning
@@ -79,9 +154,14 @@ def load_config() -> Config:
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),
         elevenlabs_model=os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
-        larry_hardware=os.environ.get("LARRY_HARDWARE", _default_hardware()),
+        larry_hardware=larry_hardware,
         wake_word_model=os.environ.get("WAKE_WORD_MODEL", "hey_jarvis"),
         wake_word_custom_path=os.environ.get("WAKE_WORD_CUSTOM_PATH"),
+        stt_mute_cooldown_s=float(os.environ.get("STT_MUTE_COOLDOWN_S", "0.2")),
+        vad_start_secs=float(os.environ.get("VAD_START_SECS", "0.1")),
+        wake_sleep_timeout_s=float(os.environ.get("WAKE_SLEEP_TIMEOUT_S", "20")),
+        enable_smart_turn=_bool("ENABLE_SMART_TURN", smart_turn_default),
+        smart_turn_cpu_count=int(os.environ.get("SMART_TURN_CPU_COUNT", "2")),
         data_dir=data_dir,
         speakers_db=data_dir / "speakers.db",
         conversations_db=data_dir / "conversations.db",

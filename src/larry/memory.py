@@ -18,8 +18,10 @@ from typing import Any
 
 from pipecat.services.mem0.memory import Mem0MemoryService
 
+from larry.config import Config
 
-def make_memory_service(cfg: Any, *, user_id: str = "unknown") -> Mem0MemoryService:
+
+def make_memory_service(cfg: Config, *, user_id: str = "unknown") -> Mem0MemoryService:
     """Return a self-hosted Mem0MemoryService wired into the Pipecat pipeline.
 
     The service uses:
@@ -111,7 +113,7 @@ class ConversationLog:
         cur = self._conn.execute(
             "SELECT id, ts, speaker, user_text, larry_text"
             " FROM turns WHERE speaker = ?"
-            " ORDER BY ts DESC LIMIT ?",
+            " ORDER BY ts DESC, rowid DESC LIMIT ?",
             (speaker, limit),
         )
         return [dict(row) for row in cur.fetchall()]

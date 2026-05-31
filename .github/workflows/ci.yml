@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least-privilege token (defends against compromised-action escalation).
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: lint · format · types · tests
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are SHA-pinned (tag in comment) per supply-chain
+      # hygiene; bump the SHA and comment together when upgrading.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # PyAudio (via pipecat-ai[local]) builds against portaudio headers.
+      - name: Install audio system deps
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      # --locked fails the build if uv.lock is stale vs pyproject.toml.
+      # No --extra pi: the mock hardware backend is the CI default.
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Ruff lint
+        run: uv run ruff check
+
+      - name: Ruff format check
+        run: uv run ruff format --check
+
+      - name: Pyright
+        run: uv run pyright
+
+      - name: Tests
+        run: uv run pytest

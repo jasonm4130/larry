@@ -15,12 +15,15 @@ def main():
 
     if args.cmd == "enroll":
         from larry.cli.enroll import main as enroll_main
+
         enroll_main(args.name)
     elif args.cmd == "test-jaw":
         from larry.cli.test_jaw import main as test_jaw_main
+
         test_jaw_main()
     else:
         from larry.pipeline import run
+
         asyncio.run(run())
 
 

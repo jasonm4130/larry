@@ -1,6 +1,6 @@
 [project]
 name = "larry"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Cursed AI character in a Halloween skull on a Raspberry Pi 5."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,13 +8,13 @@ authors = [{ name = "jasonm4130", email = "jasonm4130@gmail.com" }]
 
 dependencies = [
     "pipecat-ai[anthropic,elevenlabs,groq,silero,mem0,local]>=0.0.108",
-    "openwakeword",
-    "sounddevice",
-    "numpy",
-    "python-dotenv",
-    "resemblyzer",
-    "gpiozero",
-    "fastembed",
+    "openwakeword>=0.4.0",
+    "sounddevice>=0.5.5",
+    "numpy>=2.4.6",
+    "python-dotenv>=1.2.2",
+    "resemblyzer>=0.1.4",
+    "gpiozero>=2.0.1",
+    "fastembed>=0.8.0",
     "pywebrtc-audio>=0.1.0",
 ]
 
@@ -29,8 +29,10 @@ pi = [
 [dependency-groups]
 dev = [
     "pytest",
+    "pytest-cov",
     "ruff",
     "pyright",
+    "pre-commit",
 ]
 
 [project.scripts]
@@ -39,6 +41,9 @@ larry = "larry.__main__:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/larry/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/larry"]
@@ -58,4 +63,12 @@ include = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra --cov=larry --cov-report=term-missing"
+
+[tool.coverage.run]
+# Drivers / entrypoint / CLI are integration-only; exclude from the core-logic number.
+omit = [
+    "*/larry/__main__.py",
+    "*/larry/cli/*",
+    "*/larry/hardware/jaw_pca9685.py",
+]

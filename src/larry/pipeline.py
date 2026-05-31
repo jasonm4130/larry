@@ -21,7 +21,6 @@ import logging
 import logging.handlers
 import os
 import random
-import re
 import sys
 from pathlib import Path
 
@@ -30,11 +29,6 @@ from loguru import logger as _loguru
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
-    BotStartedSpeakingFrame,
-    BotStoppedSpeakingFrame,
-    Frame,
-    STTMuteFrame,
-    TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
     TTSStartedFrame,
@@ -52,191 +46,30 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.audio.vad_processor import VADProcessor
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.xai.llm import GrokLLMService
 from pipecat.services.xai.stt import XAISTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
-from pipecat.turns.user_mute import AlwaysUserMuteStrategy
+from pipecat.turns.user_mute import AlwaysUserMuteStrategy, BaseUserMuteStrategy
+from pipecat.turns.user_stop import (
+    SpeechTimeoutUserTurnStopStrategy,
+    TurnAnalyzerUserTurnStopStrategy,
+)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
 from larry.hardware import get_jaw_driver
 from larry.jaw import JawAmplitudeMapper
 from larry.memory import ConversationLog, make_memory_service
+from larry.processors import STTMuteOnBotSpeech, WhisperHallucinationFilter
 from larry.speaker_id import SpeakerIDProcessor
 from larry.stt_mute_fix import MutedGroqSTTService
 from larry.wake import make_wake_word_gate
 
 logger = logging.getLogger(__name__)
-
-
-# Common Whisper-large-v3 silence-hallucinations.  When the audio buffer
-# fed to STT is mostly silence (between phrases, or at the tail of a turn),
-# Whisper sometimes invents these phrases because they're over-represented
-# in its YouTube training data.  Dropping them prevents Larry from
-# responding to phantom "Thank yous" he never received.
-_WHISPER_HALLUCINATIONS = frozenset(
-    {
-        "thank you.",
-        "thanks for watching.",
-        "thanks for watching!",
-        "thank you for watching.",
-        "thank you for watching!",
-        "subscribe.",
-        "like and subscribe.",
-        "bye.",
-        "bye!",
-        "you",
-        ".",
-        "",
-    }
-)
-
-
-class WhisperHallucinationFilter(FrameProcessor):
-    """Drop TranscriptionFrames that look like Whisper silence-hallucinations.
-
-    Two layers, belt-and-braces:
-
-    1. Per-segment confidence: when the STT is configured with
-       ``include_prob_metrics=True`` (Groq returns ``verbose_json``), the
-       transcription response carries a ``segments`` list with
-       ``no_speech_prob``, ``avg_logprob`` and ``compression_ratio`` per
-       segment.  Any segment that trips a threshold is dropped; if every
-       segment is dropped, the whole frame is dropped.  Thresholds default
-       to the OpenAI-documented "consider this silent / failed" values
-       (no_speech_prob > 0.6, avg_logprob < -1.0, compression_ratio > 2.4)
-       and are tunable from real logs.
-
-    2. Static denylist: case-insensitive match against
-       ``_WHISPER_HALLUCINATIONS`` for low-probability silence phrases that
-       still slip through the confidence gate.  Matching ignores any
-       ``[speaker: name]`` prefix added upstream by SpeakerIDProcessor.
-
-    Contract assumption: ``frame.result`` is either ``None`` or an
-    ``openai.types.audio.TranscriptionVerbose``-shaped object exposing
-    ``.segments`` (a list of items with ``no_speech_prob``, ``avg_logprob``,
-    ``compression_ratio``, ``text``).  We duck-type via ``getattr`` so a
-    plain-json response (or a future Pipecat schema change) degrades to the
-    static denylist instead of crashing.
-    """
-
-    def __init__(
-        self,
-        *,
-        no_speech_prob_max: float = 0.6,
-        avg_logprob_min: float = -1.0,
-        compression_ratio_max: float = 2.4,
-        **kwargs,
-    ) -> None:
-        super().__init__(**kwargs)
-        self._no_speech_prob_max = no_speech_prob_max
-        self._avg_logprob_min = avg_logprob_min
-        self._compression_ratio_max = compression_ratio_max
-
-    def _segment_reject_reason(self, segment: object) -> str | None:
-        """Return a short reason string if this segment should be dropped, else None."""
-        no_speech = getattr(segment, "no_speech_prob", None)
-        avg_logprob = getattr(segment, "avg_logprob", None)
-        compression = getattr(segment, "compression_ratio", None)
-
-        if isinstance(no_speech, (int, float)) and no_speech > self._no_speech_prob_max:
-            return f"no_speech_prob={no_speech:.3f}>{self._no_speech_prob_max}"
-        if isinstance(avg_logprob, (int, float)) and avg_logprob < self._avg_logprob_min:
-            return f"avg_logprob={avg_logprob:.3f}<{self._avg_logprob_min}"
-        if isinstance(compression, (int, float)) and compression > self._compression_ratio_max:
-            return f"compression_ratio={compression:.3f}>{self._compression_ratio_max}"
-        return None
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame):
-            # Layer 1: per-segment confidence (only when verbose_json result is attached).
-            segments = getattr(frame.result, "segments", None)
-            # Diagnostic: one-time log per process tells us why the verbose
-            # confidence layer isn't engaging — wrong attr path? missing
-            # response_format? thresholds tuned wrong? — without spamming.
-            if segments is None and not getattr(self, "_logged_missing_segments", False):
-                logger.info(
-                    "verbose_json segments not found on TranscriptionFrame.result "
-                    "(type=%s, attrs=%s, text=%r) — falling back to static denylist only.",
-                    type(frame.result).__name__,
-                    sorted(a for a in dir(frame.result) if not a.startswith("_"))[:20],
-                    frame.text,
-                )
-                self._logged_missing_segments = True
-            if segments:
-                kept_any = False
-                for seg in segments:
-                    seg_text = getattr(seg, "text", "")
-                    reason = self._segment_reject_reason(seg)
-                    if reason is not None:
-                        logger.info(
-                            "Dropping low-confidence Whisper segment: text=%r "
-                            "no_speech_prob=%r avg_logprob=%r compression_ratio=%r reason=%s",
-                            seg_text,
-                            getattr(seg, "no_speech_prob", None),
-                            getattr(seg, "avg_logprob", None),
-                            getattr(seg, "compression_ratio", None),
-                            reason,
-                        )
-                    else:
-                        kept_any = True
-                if not kept_any:
-                    logger.info(
-                        "Dropping Whisper transcription (all segments low-confidence): %r",
-                        frame.text,
-                    )
-                    return
-
-            # Layer 2: static denylist on the final text (case-insensitive,
-            # ignoring any [speaker: name] prefix).
-            stripped = re.sub(r"^\[speaker:[^\]]*\]\s*", "", frame.text).strip().lower()
-            if stripped in _WHISPER_HALLUCINATIONS:
-                logger.info("Dropping Whisper hallucination: %r", frame.text)
-                return
-        await self.push_frame(frame, direction)
-
-
-class STTMuteOnBotSpeech(FrameProcessor):
-    """Mute the STT while the bot is speaking, plus a cool-down trail.
-
-    AlwaysUserMuteStrategy only gates the user aggregator — VAD + Whisper
-    still run on echo audio, producing phantom transcripts that have shown
-    up in logs.  This filter sends STTMuteFrame(mute=True) when the bot
-    starts and STTMuteFrame(mute=False) after `cool_down_s` of bot silence,
-    so the mic-echo trail after Larry finishes a sentence doesn't get
-    transcribed.
-    """
-
-    def __init__(self, cool_down_s: float = 0.6, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self._cool_down_s = cool_down_s
-        self._unmute_task: asyncio.Task | None = None
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, BotStartedSpeakingFrame):
-            if self._unmute_task is not None and not self._unmute_task.done():
-                self._unmute_task.cancel()
-            await self.push_frame(STTMuteFrame(mute=True), FrameDirection.DOWNSTREAM)
-        elif isinstance(frame, BotStoppedSpeakingFrame):
-            if self._unmute_task is not None and not self._unmute_task.done():
-                self._unmute_task.cancel()
-            self._unmute_task = asyncio.create_task(self._delayed_unmute())
-
-        await self.push_frame(frame, direction)
-
-    async def _delayed_unmute(self) -> None:
-        try:
-            await asyncio.sleep(self._cool_down_s)
-            await self.push_frame(STTMuteFrame(mute=False), FrameDirection.DOWNSTREAM)
-        except asyncio.CancelledError:
-            pass
 
 
 # In-character spontaneous utterances for proactive idle moments.
@@ -358,9 +191,7 @@ def _load_system_prompt(personality_path: Path) -> str:
     elif hour < 18:
         tod = "It is late afternoon. The pretense of patience drops."
     else:
-        tod = (
-            "It is evening. The office is empty. You are still on. You note this."
-        )
+        tod = "It is evening. The office is empty. You are still on. You note this."
     return f"{card}\n\n## Current Context\n\n{tod}\n"
 
 
@@ -405,6 +236,7 @@ async def run() -> None:
     wake_gate = make_wake_word_gate(
         model_name=cfg.wake_word_model,
         custom_model_path=cfg.wake_word_custom_path,
+        sleep_timeout_s=cfg.wake_sleep_timeout_s,
     )
 
     # ------------------------------------------------------------------
@@ -421,10 +253,21 @@ async def run() -> None:
     # turn over.  0.2 shaves ~100ms vs 0.3 at the cost of being slightly
     # quicker to declare end-of-turn during mid-sentence pauses.  Worth it
     # for perceived latency; revisit if Larry starts interrupting people.
+    #
+    # start_secs is how long speech must persist before VAD declares a turn
+    # *start*.  Pipecat's 0.2 default silently drops short replies ("ok",
+    # "yes", "no") — the maintainer's documented fix is 0.1-0.15 (issue #984).
+    # Kept low here because Smart Turn v3 below decides actual end-of-turn, so
+    # an aggressive start_secs doesn't translate into false interruptions.
+    # stop_secs must stay 0.2 — Smart Turn v3 requires it as its base window.
+    #
+    # One VADParams instance, shared by the front-end VADProcessor and the
+    # aggregator's analyzer below, so the two never drift (the aggregator used
+    # to construct a bare SileroVADAnalyzer() with strict 0.6/0.7 defaults that
+    # re-rejected normal-volume desk audio the front VAD had already accepted).
+    vad_params = VADParams(min_volume=0.1, stop_secs=0.2, start_secs=cfg.vad_start_secs)
     vad_processor = VADProcessor(
-        vad_analyzer=SileroVADAnalyzer(
-            params=VADParams(min_volume=0.1, stop_secs=0.2),
-        ),
+        vad_analyzer=SileroVADAnalyzer(params=vad_params),
     )
 
     # ------------------------------------------------------------------
@@ -517,17 +360,56 @@ async def run() -> None:
     # ------------------------------------------------------------------
     system_prompt = _load_system_prompt(cfg.personality_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
-    # AlwaysUserMuteStrategy suppresses VAD / transcription / interruption
-    # frames while the bot is speaking.  On a Mac dev setup the mic and
-    # speaker share a device, so any barge-in strategy mistakes Larry's
-    # own voice for the user.  Revisit on the Pi where the desk mic is
-    # physically separated from the speaker.
+
+    # Barge-in / mute policy.  AlwaysUserMuteStrategy suppresses VAD /
+    # transcription / interruption frames while the bot is speaking — needed on
+    # Mac dev where the mic and speaker share one device (Larry hears himself),
+    # but on the Pi the Jabra Speak 510's hardware AEC removes the echo, so we
+    # drop the strategy there to enable barge-in (talk over Larry → he yields).
+    # STTMuteOnBotSpeech still guards against self-transcription during active
+    # bot speech on both platforms; only its short post-speech cool-down trails.
+    on_pi = cfg.larry_hardware == "pca9685"
+    user_mute_strategies: list[BaseUserMuteStrategy] = [] if on_pi else [AlwaysUserMuteStrategy()]
+    logger.info(
+        "Barge-in %s (hardware=%s); AlwaysUserMuteStrategy %s",
+        "enabled" if on_pi else "disabled",
+        cfg.larry_hardware,
+        "off" if on_pi else "on",
+    )
+
+    # End-of-turn detection.  Pipecat 1.2.1's default stop strategy is already
+    # Smart Turn v3 (TurnAnalyzerUserTurnStopStrategy + LocalSmartTurnAnalyzerV3)
+    # — it runs whether or not we name it.  We make it explicit so cpu_count is
+    # tunable for the Pi 5 and so it can be swapped out: when disabled we fall
+    # back to pure VAD/STT-timeout endpointing (no neural model), which is the
+    # A/B baseline if Smart Turn is suspected of holding turns open in noise.
+    # start strategies are left to the aggregator default (VAD + transcription).
+    if cfg.enable_smart_turn:
+        from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+
+        user_turn_strategies = UserTurnStrategies(
+            stop=[
+                TurnAnalyzerUserTurnStopStrategy(
+                    turn_analyzer=LocalSmartTurnAnalyzerV3(cpu_count=cfg.smart_turn_cpu_count),
+                ),
+            ],
+        )
+        logger.info("End-of-turn: Smart Turn v3 (cpu_count=%d)", cfg.smart_turn_cpu_count)
+    else:
+        user_turn_strategies = UserTurnStrategies(
+            stop=[SpeechTimeoutUserTurnStopStrategy()],
+        )
+        logger.info("End-of-turn: VAD/STT-timeout only (Smart Turn disabled)")
+
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            # Share the tuned VADParams with the front-end VADProcessor so the
+            # two analyzers agree on what counts as speech.
+            vad_analyzer=SileroVADAnalyzer(params=vad_params),
             user_idle_timeout=cfg.idle_timeout_s,
-            user_mute_strategies=[AlwaysUserMuteStrategy()],
+            user_mute_strategies=user_mute_strategies,
+            user_turn_strategies=user_turn_strategies,
         ),
     )
     user_agg = aggregators.user()
@@ -549,22 +431,24 @@ async def run() -> None:
     # downstream audio processors).  The aggregator consumes LLMTextFrames
     # to build the assistant turn for context; if placed before TTS it
     # swallows them and TTS gets nothing to speak.
-    pipeline = Pipeline([
-        transport.input(),
-        wake_gate,
-        vad_processor,
-        STTMuteOnBotSpeech(cool_down_s=1.0),
-        speaker_id,
-        stt,
-        WhisperHallucinationFilter(),
-        user_agg,
-        mem0_service,
-        llm,
-        tts,
-        audio_buffer,
-        transport.output(),
-        assistant_agg,
-    ])
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            wake_gate,
+            vad_processor,
+            STTMuteOnBotSpeech(cool_down_s=cfg.stt_mute_cooldown_s),
+            speaker_id,
+            stt,
+            WhisperHallucinationFilter(),
+            user_agg,
+            mem0_service,
+            llm,
+            tts,
+            audio_buffer,
+            transport.output(),
+            assistant_agg,
+        ]
+    )
 
     task = PipelineTask(
         pipeline,
@@ -616,26 +500,36 @@ async def run() -> None:
         sum(len(b) for b in cue_audio.values()),
     )
 
+    # Hold strong references to fire-and-forget cue tasks so the event loop
+    # doesn't garbage-collect them mid-flight (asyncio only keeps weak refs).
+    _cue_tasks: set[asyncio.Task] = set()
+
     async def _play_cue(line: str) -> None:
         audio = cue_audio.get(line)
         if audio is None:
             await task.queue_frame(TTSSpeakFrame(text=line))
             return
-        await task.queue_frames([
-            TTSStartedFrame(),
-            TTSAudioRawFrame(audio=audio, sample_rate=24000, num_channels=1),
-            TTSStoppedFrame(),
-        ])
+        await task.queue_frames(
+            [
+                TTSStartedFrame(),
+                TTSAudioRawFrame(audio=audio, sample_rate=24000, num_channels=1),
+                TTSStoppedFrame(),
+            ]
+        )
 
     def _on_wake() -> None:
         line = random.choice(_WAKE_CUES)
         logger.info("Wake cue: %r", line)
-        asyncio.create_task(_play_cue(line))
+        task = asyncio.create_task(_play_cue(line))
+        _cue_tasks.add(task)
+        task.add_done_callback(_cue_tasks.discard)
 
     def _on_sleep() -> None:
         line = random.choice(_SLEEP_CUES)
         logger.info("Sleep cue: %r", line)
-        asyncio.create_task(_play_cue(line))
+        task = asyncio.create_task(_play_cue(line))
+        _cue_tasks.add(task)
+        task.add_done_callback(_cue_tasks.discard)
 
     wake_gate.on_wake = _on_wake
     wake_gate.on_sleep = _on_sleep
@@ -674,10 +568,16 @@ async def run() -> None:
         # Grab the last user message from context to capture what was said.
         messages = context.get_messages()
         for msg in reversed(messages):
-            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
-                _pending["user_text"] = msg["content"]
+            # context.get_messages() returns a mix of dict-style standard
+            # messages and pipecat LLMSpecificMessage dataclasses; only the
+            # former support .get()/__getitem__, so skip the rest.
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if msg.get("role") == "user" and isinstance(content, str):
+                _pending["user_text"] = content
                 break
-        _pending["speaker"] = speaker_id._current_speaker  # type: ignore[attr-defined]
+        _pending["speaker"] = speaker_id.current_speaker
 
     @assistant_agg.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message) -> None:  # noqa: ARG001
@@ -700,4 +600,7 @@ async def run() -> None:
     except KeyboardInterrupt:
         logger.info("Larry going to sleep.")
     finally:
-        jaw.close()
+        try:
+            jaw.close()
+        except Exception:
+            logger.warning("jaw close failed during shutdown", exc_info=True)

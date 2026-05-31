@@ -72,6 +72,10 @@ class SpeakerIDProcessor(FrameProcessor):
             f"threshold={match_threshold}, window={window_seconds}s"
         )
 
+    @property
+    def current_speaker(self) -> str:
+        return self._current_speaker
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
@@ -103,7 +107,7 @@ class SpeakerIDProcessor(FrameProcessor):
     def _identify_speaker(self, pcm_window: bytes) -> None:
         """Embed one window of audio and update _current_speaker."""
         audio = pcm16_to_float32(pcm_window)
-        embedding = self._encoder.embed_utterance(audio)
+        embedding = np.asarray(self._encoder.embed_utterance(audio))
 
         if not self._enrolled:
             return

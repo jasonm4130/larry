@@ -88,6 +88,18 @@ def test_recent_turns_newest_first(tmp_path):
     assert [t["id"] for t in turns] == sorted((t["id"] for t in turns), reverse=True)
 
 
+def test_recent_turns_newest_first_same_second(tmp_path):
+    # Regression: two turns logged via the public API land in the same
+    # wall-clock second, so they tie on the second-resolution CURRENT_TIMESTAMP.
+    # The rowid DESC tie-breaker must still surface the newest insert first.
+    log = ConversationLog(tmp_path / "conv.db")
+    log.log_turn("gus", "first", "l1")
+    log.log_turn("gus", "second", "l2")
+
+    turns = log.recent_turns("gus")
+    assert [t["user_text"] for t in turns] == ["second", "first"]
+
+
 def test_recent_turns_respects_limit(tmp_path):
     log = ConversationLog(tmp_path / "conv.db")
     for i in range(5):

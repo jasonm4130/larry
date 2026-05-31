@@ -1328,16 +1328,16 @@ requires-dist = [
     { name = "adafruit-blinka", marker = "extra == 'pi'" },
     { name = "adafruit-circuitpython-pca9685", marker = "extra == 'pi'" },
     { name = "adafruit-circuitpython-servokit", marker = "extra == 'pi'" },
-    { name = "fastembed" },
-    { name = "gpiozero" },
+    { name = "fastembed", specifier = ">=0.8.0" },
+    { name = "gpiozero", specifier = ">=2.0.1" },
     { name = "lgpio", marker = "extra == 'pi'" },
-    { name = "numpy" },
-    { name = "openwakeword" },
+    { name = "numpy", specifier = ">=2.4.6" },
+    { name = "openwakeword", specifier = ">=0.4.0" },
     { name = "pipecat-ai", extras = ["anthropic", "elevenlabs", "groq", "local", "mem0", "silero"], specifier = ">=0.0.108" },
-    { name = "python-dotenv" },
+    { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "pywebrtc-audio", specifier = ">=0.1.0" },
-    { name = "resemblyzer" },
-    { name = "sounddevice" },
+    { name = "resemblyzer", specifier = ">=0.1.4" },
+    { name = "sounddevice", specifier = ">=0.5.5" },
 ]
 provides-extras = ["pi"]
 

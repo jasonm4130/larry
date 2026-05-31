@@ -500,6 +500,10 @@ async def run() -> None:
         sum(len(b) for b in cue_audio.values()),
     )
 
+    # Hold strong references to fire-and-forget cue tasks so the event loop
+    # doesn't garbage-collect them mid-flight (asyncio only keeps weak refs).
+    _cue_tasks: set[asyncio.Task] = set()
+
     async def _play_cue(line: str) -> None:
         audio = cue_audio.get(line)
         if audio is None:
@@ -516,12 +520,16 @@ async def run() -> None:
     def _on_wake() -> None:
         line = random.choice(_WAKE_CUES)
         logger.info("Wake cue: %r", line)
-        asyncio.create_task(_play_cue(line))
+        task = asyncio.create_task(_play_cue(line))
+        _cue_tasks.add(task)
+        task.add_done_callback(_cue_tasks.discard)
 
     def _on_sleep() -> None:
         line = random.choice(_SLEEP_CUES)
         logger.info("Sleep cue: %r", line)
-        asyncio.create_task(_play_cue(line))
+        task = asyncio.create_task(_play_cue(line))
+        _cue_tasks.add(task)
+        task.add_done_callback(_cue_tasks.discard)
 
     wake_gate.on_wake = _on_wake
     wake_gate.on_sleep = _on_sleep
@@ -569,7 +577,7 @@ async def run() -> None:
             if msg.get("role") == "user" and isinstance(content, str):
                 _pending["user_text"] = content
                 break
-        _pending["speaker"] = speaker_id._current_speaker  # type: ignore[attr-defined]
+        _pending["speaker"] = speaker_id.current_speaker
 
     @assistant_agg.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message) -> None:  # noqa: ARG001
@@ -592,4 +600,7 @@ async def run() -> None:
     except KeyboardInterrupt:
         logger.info("Larry going to sleep.")
     finally:
-        jaw.close()
+        try:
+            jaw.close()
+        except Exception:
+            logger.warning("jaw close failed during shutdown", exc_info=True)

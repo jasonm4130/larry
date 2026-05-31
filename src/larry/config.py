@@ -58,6 +58,63 @@ class Config:
     idle_timeout_s: float  # seconds of user silence before proactive utterance fires
     proactive_probability: float  # probability [0, 1] of speaking on each idle trigger
 
+    def __post_init__(self) -> None:
+        def _check(cond: bool, name: str, val: object, msg: str) -> None:
+            if not cond:
+                raise ValueError(f"{name} {msg}, got {val!r}")
+
+        _check(
+            0.0 <= self.proactive_probability <= 1.0,
+            "proactive_probability",
+            self.proactive_probability,
+            "must be in [0, 1]",
+        )
+        _check(
+            0 <= self.jaw_open_angle <= 180,
+            "jaw_open_angle",
+            self.jaw_open_angle,
+            "must be in [0, 180]",
+        )
+        _check(
+            0 <= self.jaw_closed_angle <= 180,
+            "jaw_closed_angle",
+            self.jaw_closed_angle,
+            "must be in [0, 180]",
+        )
+        _check(
+            0 <= self.jaw_servo_channel <= 15,
+            "jaw_servo_channel",
+            self.jaw_servo_channel,
+            "must be in [0, 15]",
+        )
+        _check(self.idle_timeout_s > 0, "idle_timeout_s", self.idle_timeout_s, "must be > 0")
+        _check(
+            self.wake_sleep_timeout_s > 0,
+            "wake_sleep_timeout_s",
+            self.wake_sleep_timeout_s,
+            "must be > 0",
+        )
+        _check(
+            self.stt_mute_cooldown_s >= 0,
+            "stt_mute_cooldown_s",
+            self.stt_mute_cooldown_s,
+            "must be >= 0",
+        )
+        _check(self.vad_start_secs >= 0, "vad_start_secs", self.vad_start_secs, "must be >= 0")
+        _check(
+            self.smart_turn_cpu_count >= 1,
+            "smart_turn_cpu_count",
+            self.smart_turn_cpu_count,
+            "must be >= 1",
+        )
+        _check(self.jaw_noise_floor >= 0, "jaw_noise_floor", self.jaw_noise_floor, "must be >= 0")
+        _check(
+            self.jaw_peak > self.jaw_noise_floor,
+            "jaw_peak",
+            self.jaw_peak,
+            f"must be > jaw_noise_floor ({self.jaw_noise_floor!r})",
+        )
+
 
 def load_config() -> Config:
     def _require(key: str) -> str:

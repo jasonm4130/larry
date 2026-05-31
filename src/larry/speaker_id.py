@@ -72,6 +72,10 @@ class SpeakerIDProcessor(FrameProcessor):
             f"threshold={match_threshold}, window={window_seconds}s"
         )
 
+    @property
+    def current_speaker(self) -> str:
+        return self._current_speaker
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 

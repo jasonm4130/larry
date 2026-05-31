@@ -7,6 +7,8 @@ that care about provider/hardware-dependent defaults so results don't depend on
 the host platform (``_default_hardware`` keys off ``sys.platform``).
 """
 
+import dataclasses
+
 import pytest
 
 from larry.config import load_config
@@ -139,3 +141,80 @@ def test_elevenlabs_overrides(monkeypatch, required_keys):
     cfg = load_config()
     assert cfg.elevenlabs_voice_id == "my-voice"
     assert cfg.elevenlabs_model == "eleven_v3"
+
+
+# --- __post_init__ fail-fast validation (env-driven fields) ----------------
+
+
+@pytest.mark.parametrize(
+    ("env_var", "bad_value", "field_name"),
+    [
+        ("PROACTIVE_PROBABILITY", "1.5", "proactive_probability"),
+        ("PROACTIVE_PROBABILITY", "-0.1", "proactive_probability"),
+        ("IDLE_TIMEOUT_S", "0", "idle_timeout_s"),
+        ("IDLE_TIMEOUT_S", "-5", "idle_timeout_s"),
+        ("WAKE_SLEEP_TIMEOUT_S", "0", "wake_sleep_timeout_s"),
+        ("WAKE_SLEEP_TIMEOUT_S", "-1", "wake_sleep_timeout_s"),
+        ("STT_MUTE_COOLDOWN_S", "-0.1", "stt_mute_cooldown_s"),
+        ("VAD_START_SECS", "-0.1", "vad_start_secs"),
+        ("SMART_TURN_CPU_COUNT", "0", "smart_turn_cpu_count"),
+        ("SMART_TURN_CPU_COUNT", "-1", "smart_turn_cpu_count"),
+        ("JAW_NOISE_FLOOR", "-0.01", "jaw_noise_floor"),
+    ],
+)
+def test_invalid_env_value_raises_value_error(
+    monkeypatch, required_keys, env_var, bad_value, field_name
+):
+    monkeypatch.setenv(env_var, bad_value)
+    with pytest.raises(ValueError) as exc:
+        load_config()
+    assert field_name in str(exc.value)
+    assert bad_value.lstrip("-") in str(exc.value) or bad_value in str(exc.value)
+
+
+def test_jaw_peak_not_above_noise_floor_raises(monkeypatch, required_keys):
+    # jaw_peak must be strictly greater than jaw_noise_floor.
+    monkeypatch.setenv("JAW_NOISE_FLOOR", "0.3")
+    monkeypatch.setenv("JAW_PEAK", "0.3")
+    with pytest.raises(ValueError) as exc:
+        load_config()
+    assert "jaw_peak" in str(exc.value)
+
+
+# --- __post_init__ validation (hardcoded fields, via direct construction) ---
+
+
+def _valid_config_kwargs(required_keys):
+    """A fully-valid kwargs dict mirroring load_config() defaults."""
+    cfg = load_config()
+    return dataclasses.asdict(cfg)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    [
+        ("jaw_open_angle", 181),
+        ("jaw_open_angle", -1),
+        ("jaw_closed_angle", 200),
+        ("jaw_closed_angle", -5),
+        ("jaw_servo_channel", 16),
+        ("jaw_servo_channel", -1),
+    ],
+)
+def test_invalid_hardcoded_field_raises_value_error(required_keys, field_name, bad_value):
+    from larry.config import Config
+
+    kwargs = _valid_config_kwargs(required_keys)
+    kwargs[field_name] = bad_value
+    with pytest.raises(ValueError) as exc:
+        Config(**kwargs)
+    assert field_name in str(exc.value)
+    assert str(bad_value) in str(exc.value)
+
+
+def test_valid_config_constructs_without_error(required_keys):
+    # Sanity: the default config passes validation.
+    from larry.config import Config
+
+    kwargs = _valid_config_kwargs(required_keys)
+    Config(**kwargs)

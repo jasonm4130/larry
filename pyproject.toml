@@ -8,13 +8,13 @@ authors = [{ name = "jasonm4130", email = "jasonm4130@gmail.com" }]
 
 dependencies = [
     "pipecat-ai[anthropic,elevenlabs,groq,silero,mem0,local]>=0.0.108",
-    "openwakeword",
-    "sounddevice",
-    "numpy",
-    "python-dotenv",
-    "resemblyzer",
-    "gpiozero",
-    "fastembed",
+    "openwakeword>=0.4.0",
+    "sounddevice>=0.5.5",
+    "numpy>=2.4.6",
+    "python-dotenv>=1.2.2",
+    "resemblyzer>=0.1.4",
+    "gpiozero>=2.0.1",
+    "fastembed>=0.8.0",
     "pywebrtc-audio>=0.1.0",
 ]
 

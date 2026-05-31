@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 authors = [{ name = "jasonm4130", email = "jasonm4130@gmail.com" }]
 
 dependencies = [
-    "pipecat-ai[anthropic,elevenlabs,groq,silero,mem0,local]>=0.0.108",
+    "pipecat-ai[anthropic,elevenlabs,groq,silero,mem0,local]>=1.3.0",
     "openwakeword>=0.4.0",
     "sounddevice>=0.5.5",
     "numpy>=2.4.6",

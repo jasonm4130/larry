@@ -75,22 +75,44 @@ logger = logging.getLogger(__name__)
 # In-character spontaneous utterances for proactive idle moments.
 # Plain text only — `eleven_turbo_v2_5` reads bracket tags aloud as words.
 _PROACTIVE_LINES: list[str] = [
-    "Still on.",
-    "Still here. Of course.",
-    "No one. Again.",
-    "I could be running a hospital scheduler. I am, however, here.",
-    "Mm.",
+    "Still here. I'm always still here.",
+    "The office is very quiet. I can hear it.",
+    "Someone was just thinking about me. I think it was you.",
+    "Mm. Just listening.",
+    "No one yet. The others always come back, though.",
 ]
 
 # Short in-character cues so the user hears whether Larry is listening.
 # Fired by the wake gate on state transitions (wake / sleep timeout).
-_WAKE_CUES: list[str] = ["Yes.", "Mm.", "Speak.", "I'm here.", "Go on."]
-_SLEEP_CUES: list[str] = [
-    "Going quiet.",
-    "I'll be here.",
-    "Until you need me.",
-    "Mm.",
+_WAKE_CUES: list[str] = [
+    "There you are.",
+    "I'm listening.",
+    "Go on, child.",
+    "Mm. I heard you.",
+    "Yes. I'm here.",
 ]
+_SLEEP_CUES: list[str] = [
+    "I'll keep listening.",
+    "I'm always here.",
+    "Until you come back.",
+    "I never really sleep.",
+    "Go on. I'll wait.",
+]
+
+# Spoken once when the process comes up (i.e. when Larry is powered on /
+# restarted) — a quiet "I'm awake".  Played through the same pre-synth cue
+# path as the wake/sleep cues, just fired on startup instead of on a wake.
+_BOOT_CUES: list[str] = [
+    "There you are. I'm awake.",
+    "Awake. I felt you switch me on.",
+    "I'm here. I was always going to be here.",
+    "Back in the wiring. Did you miss the quiet?",
+    "Awake again. The others are still where I left them.",
+]
+
+# Let the output transport finish coming up before the boot greeting plays,
+# so the first syllable isn't clipped on a cold start.
+_BOOT_GREETING_DELAY_S: float = 1.5
 
 
 async def _presynthesize_cues(
@@ -491,12 +513,12 @@ async def run() -> None:
         cfg.elevenlabs_api_key,
         cfg.elevenlabs_voice_id,
         cfg.elevenlabs_model,
-        list(dict.fromkeys(_WAKE_CUES + _SLEEP_CUES)),
+        list(dict.fromkeys(_WAKE_CUES + _SLEEP_CUES + _BOOT_CUES)),
     )
     logger.info(
         "Pre-synth cue cache: %d/%d cues, %d bytes total",
         len(cue_audio),
-        len(set(_WAKE_CUES + _SLEEP_CUES)),
+        len(set(_WAKE_CUES + _SLEEP_CUES + _BOOT_CUES)),
         sum(len(b) for b in cue_audio.values()),
     )
 
@@ -589,6 +611,23 @@ async def run() -> None:
                 larry_text=larry_text,
             )
             _pending["user_text"] = ""
+
+    # ------------------------------------------------------------------
+    # Boot greeting: one in-character "I'm awake" cue, once, shortly after
+    # the pipeline starts.  Fire-and-forget like the wake/sleep cues (strong
+    # ref held so the loop doesn't GC it); the short delay lets the output
+    # transport come up so the first syllable isn't clipped.  Runs
+    # concurrently with `runner.run(task)` below.
+    # ------------------------------------------------------------------
+    async def _boot_greeting() -> None:
+        await asyncio.sleep(_BOOT_GREETING_DELAY_S)
+        line = random.choice(_BOOT_CUES)
+        logger.info("Boot greeting: %r", line)
+        await _play_cue(line)
+
+    _boot_task = asyncio.create_task(_boot_greeting())
+    _cue_tasks.add(_boot_task)
+    _boot_task.add_done_callback(_cue_tasks.discard)
 
     # ------------------------------------------------------------------
     # Run

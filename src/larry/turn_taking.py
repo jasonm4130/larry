@@ -1,18 +1,30 @@
 """User-turn aggregator wiring, isolated so it can be unit-tested.
 
-The front-end ``VADProcessor`` in the pipeline is the SINGLE source of VAD
-segmentation. The user aggregator must NOT be given its own ``vad_analyzer``:
-a second Silero analyzer on the same audio stream wraps its own
-``VADController`` that injects a duplicate ``VADUserStoppedSpeakingFrame`` per
-silence, so every user turn gets aggregated twice — the "Larry thinks you're
-repeating yourself" bug. The duplication is code-level, so it survives the
-Jabra Speak 510's hardware AEC. See tests/test_turn_taking.py.
+Two independent guards keep one spoken utterance == one user turn, both
+defending against the "Larry thinks you're repeating yourself" bug:
+
+1. Start strategy (the confirmed hardware cause). Pipecat's default user-turn
+   *start* set is ``[VADUserTurnStartStrategy, TranscriptionUserTurnStartStrategy]``.
+   With streaming STT, a transcription frame can land AFTER the VAD-segmented
+   turn has already closed and inference fired; the transcription-start strategy
+   then opens a SECOND turn for the same utterance, so the LLM runs twice. We pin
+   start to VAD-only (``make_user_turn_strategies``) — the front-end
+   ``VADProcessor`` is the single segmentation source.
+
+2. No second VAD analyzer (``make_user_aggregator_params``). The user aggregator
+   must not carry its own ``vad_analyzer``: a second Silero analyzer wraps its
+   own ``VADController`` that injects duplicate ``VADUserStoppedSpeakingFrame``s.
+
+Both duplications are code-level, so they survive the Jabra Speak 510's hardware
+AEC. See tests/test_turn_taking.py.
 """
 
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.turns.user_mute import BaseUserMuteStrategy
+from pipecat.turns.user_start import VADUserTurnStartStrategy
+from pipecat.turns.user_stop import BaseUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 
@@ -33,3 +45,20 @@ def make_user_aggregator_params(
         user_mute_strategies=user_mute_strategies,
         user_turn_strategies=user_turn_strategies,
     )
+
+
+def make_user_turn_strategies(
+    stop: list[BaseUserTurnStopStrategy],
+) -> UserTurnStrategies:
+    """Build user-turn strategies with a SINGLE, VAD-only *start* strategy.
+
+    Pipecat defaults ``start`` to ``[VADUserTurnStartStrategy,
+    TranscriptionUserTurnStartStrategy]`` when it is left unset. The
+    transcription-start fallback opens a duplicate turn whenever a streaming-STT
+    transcription frame arrives after the VAD turn has already closed — the
+    2x-repeat bug. Passing ``start`` explicitly (a non-empty list) suppresses the
+    default, leaving the front-end ``VADProcessor`` as the only turn-start
+    signal. The caller supplies the ``stop`` strategy (Smart Turn or
+    speech-timeout); we never touch it.
+    """
+    return UserTurnStrategies(start=[VADUserTurnStartStrategy()], stop=stop)

@@ -56,7 +56,6 @@ from pipecat.turns.user_stop import (
     SpeechTimeoutUserTurnStopStrategy,
     TurnAnalyzerUserTurnStopStrategy,
 )
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
@@ -66,7 +65,7 @@ from larry.memory import ConversationLog, make_memory_service
 from larry.processors import STTMuteOnBotSpeech, WhisperHallucinationFilter
 from larry.speaker_id import SpeakerIDProcessor
 from larry.stt_mute_fix import MutedGroqSTTService
-from larry.turn_taking import make_user_aggregator_params
+from larry.turn_taking import make_user_aggregator_params, make_user_turn_strategies
 from larry.wake import make_wake_word_gate
 
 logger = logging.getLogger(__name__)
@@ -407,11 +406,13 @@ async def run() -> None:
     # tunable for the Pi 5 and so it can be swapped out: when disabled we fall
     # back to pure VAD/STT-timeout endpointing (no neural model), which is the
     # A/B baseline if Smart Turn is suspected of holding turns open in noise.
-    # start strategies are left to the aggregator default (VAD + transcription).
+    # Start strategy is pinned to VAD-only via make_user_turn_strategies — leaving
+    # it at the aggregator default (VAD + transcription) is the 2x-repeat bug:
+    # streaming STT's late transcription opens a duplicate turn. See turn_taking.py.
     if cfg.enable_smart_turn:
         from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 
-        user_turn_strategies = UserTurnStrategies(
+        user_turn_strategies = make_user_turn_strategies(
             stop=[
                 TurnAnalyzerUserTurnStopStrategy(
                     turn_analyzer=LocalSmartTurnAnalyzerV3(cpu_count=cfg.smart_turn_cpu_count),
@@ -420,7 +421,7 @@ async def run() -> None:
         )
         logger.info("End-of-turn: Smart Turn v3 (cpu_count=%d)", cfg.smart_turn_cpu_count)
     else:
-        user_turn_strategies = UserTurnStrategies(
+        user_turn_strategies = make_user_turn_strategies(
             stop=[SpeechTimeoutUserTurnStopStrategy()],
         )
         logger.info("End-of-turn: VAD/STT-timeout only (Smart Turn disabled)")

@@ -22,10 +22,14 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
+from pipecat.turns.user_start import (
+    TranscriptionUserTurnStartStrategy,
+    VADUserTurnStartStrategy,
+)
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
-from larry.turn_taking import make_user_aggregator_params
+from larry.turn_taking import make_user_aggregator_params, make_user_turn_strategies
 
 
 def _params():
@@ -50,3 +54,26 @@ def test_user_aggregator_builds_no_internal_vad_controller():
     # No analyzer -> Pipecat leaves _vad_controller None (llm_response_universal.py:647-648),
     # so no duplicate VADUserStoppedSpeakingFrame is ever injected.
     assert user._vad_controller is None
+
+
+def test_user_turn_strategies_start_is_vad_only():
+    # The ACTUAL 2x-repeat cause (confirmed on hardware): Pipecat's default start
+    # set is [VADUserTurnStartStrategy, TranscriptionUserTurnStartStrategy]. With
+    # streaming STT, a transcription frame landing AFTER the VAD-segmented turn has
+    # already closed opens a SECOND user turn for the same utterance -> the LLM runs
+    # twice and Larry reacts as if you repeated yourself. Pin start to VAD-only so
+    # the front-end VADProcessor is the single turn-segmentation source.
+    strategies = make_user_turn_strategies(stop=[SpeechTimeoutUserTurnStopStrategy()])
+    assert len(strategies.start or []) == 1
+    assert isinstance((strategies.start or [])[0], VADUserTurnStartStrategy)
+    # The transcription-start fallback (which fires on the late streaming frames)
+    # must NOT be present — its absence is the fix.
+    assert not any(
+        isinstance(s, TranscriptionUserTurnStartStrategy) for s in (strategies.start or [])
+    )
+
+
+def test_user_turn_strategies_passes_stop_through_unchanged():
+    stop = [SpeechTimeoutUserTurnStopStrategy()]
+    strategies = make_user_turn_strategies(stop=stop)
+    assert strategies.stop == stop

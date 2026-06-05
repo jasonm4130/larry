@@ -6,6 +6,7 @@ Handlers are exercised via duck-typed _Params just like test_self_layer.py.
 """
 
 import asyncio
+import random
 
 from larry import voice_enroll as ve
 
@@ -43,40 +44,54 @@ class _Params:
     def __init__(self, arguments: dict):
         self.arguments = arguments
         self._result = None
+        self._properties = None
 
-    async def result_callback(self, result):
+    async def result_callback(self, result, *, properties=None):
         self._result = result
+        self._properties = properties
 
 
-def test_enroll_handler_arms_capture_and_returns_prompt():
+def test_enroll_handler_arms_capture_and_speaks_repeat_prompt():
     armed: list[str] = []
+    spoken: list[str] = []
 
     def fake_arm(name, **_kwargs):
         armed.append(name)
 
+    async def fake_speak(line):
+        spoken.append(line)
+
     async def body():
         params = _Params({"name": "Jason"})
-        handler = ve.make_enroll_speaker_handler(arm_capture_fn=fake_arm)
+        expected_phrase = random.Random(0).choice(ve.ENROLL_PHRASES)
+        handler = ve.make_enroll_speaker_handler(
+            arm_capture_fn=fake_arm, speak_fn=fake_speak, rng=random.Random(0)
+        )
         await handler(params)
-        assert "jason" in armed[0].lower() or "Jason" in armed[0], "arm should receive the name"
-        assert params._result is not None
-        assert params._result["status"] == "pending"
-        # Result must include the repeat phrase so Larry speaks it.
-        assert ve.REPEAT_PHRASE in params._result["prompt"]
+        assert armed == ["jason"], "arm should receive the normalised name"
+        # Larry deterministically SPEAKS a 'repeat the phrase' instruction — not
+        # relayed through the LLM — and it carries the chosen phrase.
+        assert spoken == [ve.enrollment_instruction(expected_phrase)]
+        assert spoken[0].lower().startswith("repeat the phrase")
+        assert params._result["status"] == "enrolling"
+        # The LLM's own spoken turn is suppressed so there is no double-talk.
+        assert params._properties is not None and params._properties.run_llm is False
 
     asyncio.run(body())
 
 
 def test_enroll_handler_normalises_name():
-    """Name is stripped and stored; casing kept for display but lowered for key."""
+    """Name is stripped and lower-cased for the DB key."""
     armed_names: list[str] = []
 
-    def fake_arm(name, **_kwargs):
-        armed_names.append(name)
+    async def fake_speak(_line):
+        pass
 
     async def body():
         params = _Params({"name": "  ALICE  "})
-        handler = ve.make_enroll_speaker_handler(arm_capture_fn=fake_arm)
+        handler = ve.make_enroll_speaker_handler(
+            arm_capture_fn=lambda name, **_k: armed_names.append(name), speak_fn=fake_speak
+        )
         await handler(params)
         assert armed_names[0] == "alice"   # normalised
 
@@ -85,16 +100,22 @@ def test_enroll_handler_normalises_name():
 
 def test_enroll_handler_ignores_empty_name():
     armed: list[str] = []
+    spoken: list[str] = []
 
     def fake_arm(name, **_kwargs):
         armed.append(name)
 
+    async def fake_speak(line):
+        spoken.append(line)
+
     async def body():
         params = _Params({"name": "   "})
-        handler = ve.make_enroll_speaker_handler(arm_capture_fn=fake_arm)
+        handler = ve.make_enroll_speaker_handler(arm_capture_fn=fake_arm, speak_fn=fake_speak)
         await handler(params)
         assert armed == []
+        assert spoken == []  # nothing spoken on a bad name
         assert params._result["status"] == "error"
+        assert params._properties is not None and params._properties.run_llm is False
 
     asyncio.run(body())
 
@@ -117,5 +138,7 @@ def test_dismiss_handler_calls_sleep_now_and_returns_dismissed():
         assert params._result["status"] == "dismissed"
         # Cue is played via _on_sleep; handler only returns status.
         assert "cue" not in params._result
+        # LLM's own turn suppressed — the sleep cue is the last word.
+        assert params._properties is not None and params._properties.run_llm is False
 
     asyncio.run(body())

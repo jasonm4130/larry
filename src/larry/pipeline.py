@@ -687,9 +687,16 @@ async def run() -> None:
                 **kwargs,
             )
 
+        # Larry speaks the enrollment prompt deterministically (not via the LLM),
+        # so the "repeat the phrase" instruction always actually fires.
+        async def _enroll_speak(line: str) -> None:
+            await task.queue_frame(TTSSpeakFrame(text=line))
+
         llm.register_function(
             "enroll_speaker",
-            voice_enroll.make_enroll_speaker_handler(arm_capture_fn=_arm_capture),
+            voice_enroll.make_enroll_speaker_handler(
+                arm_capture_fn=_arm_capture, speak_fn=_enroll_speak
+            ),
         )
 
         # dismiss: delegate entirely to sleep_now() → _on_sleep fires the cue.

@@ -265,9 +265,7 @@ class SpeakerIDProcessor(FrameProcessor):
         """
         if self._capture_state != "idle":
             logger.info(
-                "arm_capture(%r) ignored — capture already in state %r",
-                name,
-                self._capture_state,
+                f"arm_capture({name!r}) ignored — capture already in state {self._capture_state!r}"
             )
             return
         self._capture_name = name.strip()
@@ -281,10 +279,7 @@ class SpeakerIDProcessor(FrameProcessor):
         self._capture_embed_fn = embed_fn
         self._capture_db_path = db_path if db_path is not None else self._db_path
         logger.info(
-            "Capture armed for %r (target=%.0fs, cap=%.0fs)",
-            name,
-            target_voiced_s,
-            cap_wall_s,
+            f"Capture armed for {name!r} (target={target_voiced_s:.0f}s, cap={cap_wall_s:.0f}s)"
         )
 
     def bot_stopped_speaking(self) -> None:
@@ -292,7 +287,7 @@ class SpeakerIDProcessor(FrameProcessor):
         if self._capture_state == "armed":
             self._capture_state = "capturing"
             self._capture_start = _monotonic()  # wall-clock cap measured from here
-            logger.info("Capture accumulation started for %r", self._capture_name)
+            logger.info(f"Capture accumulation started for {self._capture_name!r}")
 
     def add_capture_audio(
         self,
@@ -330,10 +325,8 @@ class SpeakerIDProcessor(FrameProcessor):
                 audio = pcm16_to_float32(bytes(self._capture_bytes))
                 self._capture_state = "embedding"
                 logger.info(
-                    "Capture cap reached for %r: %.1fs voiced — ready (>= floor %.1fs)",
-                    name,
-                    voiced_s,
-                    self._capture_floor_voiced_s,
+                    f"Capture cap reached for {name!r}: {voiced_s:.1f}s voiced — "
+                    f"ready (>= floor {self._capture_floor_voiced_s:.1f}s)"
                 )
                 return {"status": "ready", "name": name, "audio": audio}
             else:
@@ -344,12 +337,9 @@ class SpeakerIDProcessor(FrameProcessor):
                     f"{self._capture_floor_voiced_s:.1f}s floor)"
                 )
                 logger.warning(
-                    "Capture aborted for %r: %.1fs voiced in %.1fs (floor=%.1fs, cap=%.1fs)",
-                    name,
-                    voiced_s,
-                    elapsed,
-                    self._capture_floor_voiced_s,
-                    self._capture_cap_wall_s,
+                    f"Capture aborted for {name!r}: {voiced_s:.1f}s voiced in "
+                    f"{elapsed:.1f}s (floor={self._capture_floor_voiced_s:.1f}s, "
+                    f"cap={self._capture_cap_wall_s:.1f}s)"
                 )
                 return {"status": "abort", "name": name, "reason": reason}
 
@@ -365,9 +355,7 @@ class SpeakerIDProcessor(FrameProcessor):
             name = self._capture_name
             audio = pcm16_to_float32(bytes(self._capture_bytes))
             self._capture_state = "embedding"
-            logger.info(
-                "Capture target reached for %r (%.1fs voiced)", name, voiced_s
-            )
+            logger.info(f"Capture target reached for {name!r} ({voiced_s:.1f}s voiced)")
             return {"status": "ready", "name": name, "audio": audio}
 
         return None
@@ -394,7 +382,7 @@ class SpeakerIDProcessor(FrameProcessor):
         store_speaker(db_path, name, embedding)
         # Reload in-memory enrolled set so new speaker is immediately identifiable.
         self._enrolled = load_enrolled(db_path)
-        logger.info("Enrolled %r — %d speaker(s) now enrolled", name, len(self._enrolled))
+        logger.info(f"Enrolled {name!r} — {len(self._enrolled)} speaker(s) now enrolled")
         if self._on_speaker_change:
             self._on_speaker_change(name)
         self._capture_state = "idle"

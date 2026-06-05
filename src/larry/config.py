@@ -44,6 +44,9 @@ class Config:
     mem0_dir: Path
     logs_dir: Path
     personality_path: Path
+    self_layer_path: Path
+    self_layer_cap_chars: int
+    self_evolution_enabled: bool
 
     # Servo calibration
     jaw_open_angle: int
@@ -168,6 +171,10 @@ def load_config() -> Config:
         mem0_dir=data_dir / "mem0",
         logs_dir=data_dir / "logs",
         personality_path=Path(__file__).parent / "personality" / "larry.md",
+        self_layer_path=data_dir / "larry_self.md",
+        self_layer_cap_chars=int(os.environ.get("SELF_LAYER_CAP_CHARS", "5000")),
+        self_evolution_enabled=os.environ.get("SELF_EVOLUTION_ENABLED", "true").lower()
+        not in ("false", "0", "no"),
         jaw_open_angle=60,
         jaw_closed_angle=0,
         jaw_servo_channel=0,

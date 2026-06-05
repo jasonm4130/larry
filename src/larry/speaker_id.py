@@ -45,6 +45,23 @@ def load_enrolled(db_path: Path) -> dict[str, np.ndarray]:
     return {name: np.frombuffer(blob, dtype=np.float32) for name, blob in rows}
 
 
+def store_speaker(db_path: Path, name: str, embedding: np.ndarray) -> None:
+    """Persist a speaker voiceprint (INSERT OR REPLACE on primary key name).
+
+    Creates the database file and parent directories if absent. Both the CLI
+    ``enroll`` command and the in-conversation voice-enroll path call this so
+    there is exactly one storage code path.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO speakers (name, embedding) VALUES (?, ?)",
+            (name, embedding.astype(np.float32).tobytes()),
+        )
+        conn.commit()
+
+
 class SpeakerIDProcessor(FrameProcessor):
     """Identify the active speaker from audio and tag TranscriptionFrames with their name."""
 

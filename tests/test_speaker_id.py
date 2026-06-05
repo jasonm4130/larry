@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 import larry.speaker_id as speaker_id
-from larry.speaker_id import SpeakerIDProcessor
+from larry.speaker_id import SpeakerIDProcessor, load_enrolled, store_speaker
 
 
 class _FakeEncoder:
@@ -121,3 +121,30 @@ def test_threshold_boundary_is_inclusive(monkeypatch, tmp_path):
     proc._identify_speaker(b"\x00\x00")
 
     assert proc._current_speaker == "alice"
+
+
+def test_store_speaker_round_trips_through_load_enrolled(tmp_path):
+    db = tmp_path / "speakers.db"
+    emb = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+    store_speaker(db, "jason", emb)
+    enrolled = load_enrolled(db)
+    assert "jason" in enrolled
+    np.testing.assert_array_almost_equal(enrolled["jason"], emb)
+
+
+def test_store_speaker_overwrites_existing_name(tmp_path):
+    db = tmp_path / "speakers.db"
+    old = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    new = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    store_speaker(db, "alice", old)
+    store_speaker(db, "alice", new)
+    enrolled = load_enrolled(db)
+    np.testing.assert_array_almost_equal(enrolled["alice"], new)
+
+
+def test_store_speaker_creates_db_if_missing(tmp_path):
+    db = tmp_path / "nonexistent" / "speakers.db"
+    emb = np.array([0.5, 0.5], dtype=np.float32)
+    store_speaker(db, "dan", emb)
+    assert db.exists()
+    assert "dan" in load_enrolled(db)

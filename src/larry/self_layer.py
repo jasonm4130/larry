@@ -65,13 +65,26 @@ def extract_hard_constraints(card: str) -> str:
 
 
 def compose_system_prompt(
-    *, card: str, self_block: str, time_context: str, guardrails: str
+    *,
+    card: str,
+    self_block: str,
+    time_context: str,
+    guardrails: str,
+    recency_line: str | None = None,
 ) -> str:
-    """Assemble the system prompt with the immutable guardrails LAST."""
+    """Assemble the system prompt with the immutable guardrails LAST.
+
+    ``recency_line`` is an optional coarse speaker-recency phrase appended inside
+    ``## Current Context`` (e.g. "You are speaking with Jason. Last with you 4 days ago.").
+    Pass ``None`` (the default) to omit it — callers that don't know the speaker yet.
+    """
     parts = [card.strip()]
     if self_block.strip():
         parts.append(self_block.strip())
-    parts.append(f"## Current Context\n\n{time_context}")
+    context_body = time_context
+    if recency_line:
+        context_body = f"{time_context}\n\n{recency_line}"
+    parts.append(f"## Current Context\n\n{context_body}")
     parts.append(f"{GUARDRAIL_HEADER}\n\n{GUARDRAIL_PREAMBLE}\n\n{guardrails}")
     return "\n\n".join(parts) + "\n"
 

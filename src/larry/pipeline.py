@@ -22,6 +22,7 @@ import logging.handlers
 import os
 import random
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -57,6 +58,7 @@ from pipecat.turns.user_stop import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 
+from larry import self_layer
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
 from larry.hardware import get_jaw_driver
@@ -148,6 +150,26 @@ async def _presynthesize_cues(
     return cache
 
 
+def _haiku_distill(openrouter_api_key: str, base_url: str) -> Callable[[str], str]:
+    """Return a sync prompt->text caller using OpenRouter Haiku (same model Mem0 uses)."""
+
+    def call(prompt: str) -> str:
+        r = httpx.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {openrouter_api_key}"},
+            json={
+                "model": "anthropic/claude-haiku-4.5",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+            },
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+    return call
+
+
 def _setup_logging(logs_dir: Path) -> None:
     """Configure stderr + rotating file logging for both stdlib and loguru.
 
@@ -198,8 +220,8 @@ def _setup_logging(logs_dir: Path) -> None:
     )
 
 
-def _load_system_prompt(personality_path: Path) -> str:
-    """Read the character card and append a time-of-day note."""
+def _load_system_prompt(personality_path: Path, self_layer_path: Path) -> str:
+    """Compose the system prompt: card + self-layer + time + immutable guardrails."""
     card = personality_path.read_text()
     hour = datetime.datetime.now().hour
     if hour < 9:
@@ -213,7 +235,12 @@ def _load_system_prompt(personality_path: Path) -> str:
         tod = "It is late afternoon. The pretense of patience drops."
     else:
         tod = "It is evening. The office is empty. You are still on. You note this."
-    return f"{card}\n\n## Current Context\n\n{tod}\n"
+    return self_layer.compose_system_prompt(
+        card=card,
+        self_block=self_layer.read_self_layer(self_layer_path),
+        time_context=tod,
+        guardrails=self_layer.extract_hard_constraints(card),
+    )
 
 
 async def run() -> None:
@@ -384,8 +411,10 @@ async def run() -> None:
     # reuse the returned processor instances for both the pipeline list
     # and the event-handler decorators.
     # ------------------------------------------------------------------
-    system_prompt = _load_system_prompt(cfg.personality_path)
+    system_prompt = _load_system_prompt(cfg.personality_path, cfg.self_layer_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+    if cfg.self_evolution_enabled:
+        context.set_tools(self_layer.build_self_tool())
 
     # Barge-in / mute policy.  AlwaysUserMuteStrategy suppresses VAD /
     # transcription / interruption frames while the bot is speaking — needed on
@@ -554,12 +583,49 @@ async def run() -> None:
     def _on_sleep() -> None:
         line = random.choice(_SLEEP_CUES)
         logger.info("Sleep cue: %r", line)
-        task = asyncio.create_task(_play_cue(line))
-        _cue_tasks.add(task)
-        task.add_done_callback(_cue_tasks.discard)
+        t = asyncio.create_task(_play_cue(line))
+        _cue_tasks.add(t)
+        t.add_done_callback(_cue_tasks.discard)
+
+        if cfg.self_evolution_enabled and self_layer.needs_consolidation(
+            cfg.self_layer_path, cap=cfg.self_layer_cap_chars
+        ):
+
+            async def _consolidate() -> None:
+                try:
+                    distill = _haiku_distill(cfg.openrouter_api_key, cfg.openrouter_base_url)
+                    await asyncio.to_thread(self_layer.consolidate, cfg.self_layer_path, distill)
+                    logger.info(
+                        "Self-layer consolidated (was over %d chars)", cfg.self_layer_cap_chars
+                    )
+                except Exception:
+                    # Non-fatal: the self-layer file is left intact (consolidate only
+                    # rewrites on a non-empty distillation), so Larry keeps evolving;
+                    # we just stay over cap until the next sleep. Surface it, don't crash.
+                    logger.warning("Self-layer consolidation failed", exc_info=True)
+
+            ct = asyncio.create_task(_consolidate())
+            _cue_tasks.add(ct)
+            ct.add_done_callback(_cue_tasks.discard)
 
     wake_gate.on_wake = _on_wake
     wake_gate.on_sleep = _on_sleep
+
+    if cfg.self_evolution_enabled:
+
+        async def _rebuild_system_prompt() -> None:
+            messages = context.get_messages()
+            new_system = _load_system_prompt(cfg.personality_path, cfg.self_layer_path)
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    msg["content"] = new_system
+                    break
+            context.set_messages(messages)
+
+        llm.register_function(
+            "keep_about_self",
+            self_layer.make_keep_about_self_handler(cfg.self_layer_path, _rebuild_system_prompt),
+        )
 
     # ------------------------------------------------------------------
     # Phase 5: jaw sync — drive servo from bot audio amplitude

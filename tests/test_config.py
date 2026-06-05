@@ -234,3 +234,18 @@ def test_valid_config_constructs_without_error(required_keys):
 
     kwargs = _valid_config_kwargs(required_keys)
     Config(**kwargs)
+
+
+def test_self_evolution_defaults(monkeypatch, required_keys):
+    cfg = load_config()
+    assert cfg.self_layer_path.name == "larry_self.md"
+    assert cfg.self_layer_cap_chars == 5000
+    assert cfg.self_evolution_enabled is True
+
+
+def test_self_evolution_overrides(monkeypatch, required_keys):
+    monkeypatch.setenv("SELF_LAYER_CAP_CHARS", "8000")
+    monkeypatch.setenv("SELF_EVOLUTION_ENABLED", "false")
+    cfg = load_config()
+    assert cfg.self_layer_cap_chars == 8000
+    assert cfg.self_evolution_enabled is False

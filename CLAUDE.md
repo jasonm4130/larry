@@ -28,6 +28,7 @@ LocalAudioTransport
 - **Audio tags** (`[cackle]`, `[whispers]`, etc.): also `personality/larry.md` — there's an explicit allow-list.
 - **Pipeline plumbing** (services, model swaps): `src/larry/pipeline.py`. For LLM model swaps, set `LLM_MODEL` env var (e.g. `LLM_MODEL=google/gemini-2.5-pro`) — no code change needed.
 - **Hardware**: `src/larry/hardware/`. `JawDriver` Protocol in `src/larry/jaw.py`. Mock impl in `hardware/jaw_mock.py`, real impl in `hardware/jaw_pca9685.py`. Select via `LARRY_HARDWARE=mock|pca9685`; defaults to mock on macOS, pca9685 on Linux/aarch64.
+- **Self-evolution**: Larry keeps an append-only self-layer at `data/larry_self.md` (his evolving self-concept, distinct from Mem0's per-person facts). Logic in `src/larry/self_layer.py`; he appends via the `keep_about_self` LLM tool and the layer is compacted on sleep when it exceeds `SELF_LAYER_CAP_CHARS` (default 5000). Toggle with `SELF_EVOLUTION_ENABLED`. His Strength-5 guardrails are re-asserted as an immutable prompt footer and are never editable by this layer.
 
 ## Cross-Platform Development
 

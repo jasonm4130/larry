@@ -16,6 +16,7 @@ Pipeline order:
 """
 
 import asyncio
+import contextlib
 import datetime
 import logging
 import logging.handlers
@@ -59,6 +60,7 @@ from pipecat.turns.user_stop import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 
+import larry.speaker_id as speaker_id_module
 from larry import awareness, self_layer, voice_enroll
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
@@ -337,6 +339,29 @@ async def run() -> None:
     def _on_speaker_change(new_name: str) -> None:
         mem0_service.user_id = new_name
         logger.info("Mem0 user_id updated to %r", new_name)
+
+        if new_name == "unknown":
+            _recency_line["value"] = None
+            return
+
+        # Read last_seen before updating it (so recency is "how long since
+        # they were last here", not "zero seconds ago").
+        last_seen = speaker_id_module.load_last_seen(cfg.speakers_db, new_name)
+        phrase = awareness.recency_phrase(last_seen, datetime.datetime.now(datetime.UTC))
+        if phrase is not None:
+            _recency_line["value"] = (
+                f"You are speaking with {new_name}. Last with you {phrase}."
+            )
+        else:
+            # First time this speaker has talked to Larry.
+            _recency_line["value"] = f"You are speaking with {new_name} for the first time."
+
+        speaker_id_module.touch_last_seen(cfg.speakers_db, new_name)
+        # Schedule a prompt refresh so the new recency line lands immediately.
+        # Guard: if no event loop is running yet (shouldn't happen in normal flow),
+        # the next on_user_turn_stopped will refresh instead.
+        with contextlib.suppress(RuntimeError):
+            asyncio.create_task(_refresh_system_prompt())
 
     speaker_id = SpeakerIDProcessor(
         speakers_db_path=cfg.speakers_db,

@@ -8,7 +8,16 @@ from time import monotonic as _monotonic
 
 import numpy as np
 from loguru import logger
-from pipecat.frames.frames import Frame, InputAudioRawFrame, TranscriptionFrame
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    Frame,
+    InputAudioRawFrame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from resemblyzer import VoiceEncoder
 
@@ -97,6 +106,9 @@ class SpeakerIDProcessor(FrameProcessor):
         self._capture_cap_wall_s: float = 20.0
         self._capture_embed_fn: Callable[[np.ndarray], np.ndarray] | None = None
         self._capture_db_path: Path | None = None
+        # VAD / bot-speaking state tracked for capture gating.
+        self._vad_voiced: bool = False
+        self._bot_speaking_for_capture: bool = False
 
         logger.info(
             f"SpeakerIDProcessor ready: {len(self._enrolled)} enrolled speaker(s), "
@@ -126,6 +138,35 @@ class SpeakerIDProcessor(FrameProcessor):
                     self._identify_task = asyncio.create_task(
                         asyncio.to_thread(self._identify_speaker, window)
                     )
+            # Feed capture accumulator (if armed/capturing) for every raw frame.
+            if self._capture_state == "capturing":
+                result = self.add_capture_audio(
+                    frame.audio,
+                    vad_voiced=self._vad_voiced,
+                    bot_speaking=self._bot_speaking_for_capture,
+                )
+                if result is not None:
+                    # Capture finished asynchronously — the enroll_speaker tool
+                    # result callback already fired "pending"; speak the outcome
+                    # now via TTSSpeakFrame so Larry confirms to the user.
+                    from larry.voice_enroll import ENROLL_CONFIRM, ENROLL_FAIL
+
+                    line = ENROLL_CONFIRM if result["status"] == "enrolled" else ENROLL_FAIL
+                    logger.info("Capture result: %s — speaking %r", result, line)
+                    await self.push_frame(TTSSpeakFrame(line), direction)
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking_for_capture = True
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking_for_capture = False
+            self.bot_stopped_speaking()
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame)):
+            self._vad_voiced = isinstance(frame, VADUserStartedSpeakingFrame)
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TranscriptionFrame):

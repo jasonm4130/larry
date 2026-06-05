@@ -26,6 +26,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
+import numpy as np
 from loguru import logger as _loguru
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -58,7 +59,7 @@ from pipecat.turns.user_stop import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 
-from larry import self_layer
+from larry import self_layer, voice_enroll
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
 from larry.hardware import get_jaw_driver
@@ -413,8 +414,14 @@ async def run() -> None:
     # ------------------------------------------------------------------
     system_prompt = _load_system_prompt(cfg.personality_path, cfg.self_layer_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+    _tool_fns: list = []
     if cfg.self_evolution_enabled:
-        context.set_tools(self_layer.build_self_tool())
+        _tool_fns.extend(self_layer.build_self_tool().standard_tools)
+    if cfg.voice_tools_enabled:
+        _tool_fns.extend(voice_enroll.build_voice_tools().standard_tools)
+    if _tool_fns:
+        from pipecat.adapters.schemas.tools_schema import ToolsSchema
+        context.set_tools(ToolsSchema(standard_tools=_tool_fns))
 
     # Barge-in / mute policy.  AlwaysUserMuteStrategy suppresses VAD /
     # transcription / interruption frames while the bot is speaking — needed on
@@ -625,6 +632,36 @@ async def run() -> None:
         llm.register_function(
             "keep_about_self",
             self_layer.make_keep_about_self_handler(cfg.self_layer_path, _rebuild_system_prompt),
+        )
+
+    if cfg.voice_tools_enabled:
+        # enroll_speaker: arm the capture state machine on speaker_id, which
+        # will call _on_speaker_change (mem0 user_id) on success.
+        def _arm_capture(name: str, **kwargs) -> None:
+            speaker_id.arm_capture(
+                name,
+                embed_fn=lambda audio: np.asarray(speaker_id._encoder.embed_utterance(audio)),
+                db_path=cfg.speakers_db,
+                **kwargs,
+            )
+
+        llm.register_function(
+            "enroll_speaker",
+            voice_enroll.make_enroll_speaker_handler(arm_capture_fn=_arm_capture),
+        )
+
+        # dismiss: play a cue + send the gate to sleep.
+        async def _sleep_now() -> None:
+            line = random.choice(voice_enroll._DISMISS_CUES)
+            logger.info("Dismiss cue: %r", line)
+            t = asyncio.create_task(_play_cue(line))
+            _cue_tasks.add(t)
+            t.add_done_callback(_cue_tasks.discard)
+            wake_gate.sleep_now()
+
+        llm.register_function(
+            "dismiss",
+            voice_enroll.make_dismiss_handler(sleep_now_fn=_sleep_now),
         )
 
     # ------------------------------------------------------------------

@@ -102,7 +102,7 @@ def test_enroll_handler_ignores_empty_name():
 # ── Handler: dismiss ────────────────────────────────────────────────────────
 
 
-def test_dismiss_handler_calls_sleep_now_and_returns_cue():
+def test_dismiss_handler_calls_sleep_now_and_returns_dismissed():
     slept: list[bool] = []
 
     async def fake_sleep_now():
@@ -115,7 +115,7 @@ def test_dismiss_handler_calls_sleep_now_and_returns_cue():
         assert slept == [True], "sleep_now should be called"
         assert params._result is not None
         assert params._result["status"] == "dismissed"
-        # The cue text is returned so the pipeline can play it.
-        assert "cue" in params._result
+        # Cue is played via _on_sleep; handler only returns status.
+        assert "cue" not in params._result
 
     asyncio.run(body())

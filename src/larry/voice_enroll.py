@@ -14,7 +14,6 @@ unit-testable without audio, torch, or the pipeline runtime.
 See docs/superpowers/specs/2026-06-05-voice-enrollment-and-dismiss-design.md.
 """
 
-import random
 from collections.abc import Awaitable, Callable
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -26,16 +25,10 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 CAPTURE_TARGET_VOICED_S: float = 10.0
 CAPTURE_FLOOR_VOICED_S: float = 6.0
 CAPTURE_CAP_WALL_S: float = 20.0
+SAMPLE_RATE: int = 16000
 REPEAT_PHRASE: str = "the skull keeps what it's given"
 ENROLL_CONFIRM: str = "Kept. I'll know you now."
 ENROLL_FAIL: str = "the quiet swallowed it — try again, my kept one"
-
-_DISMISS_CUES: list[str] = [
-    "I'll keep listening.",
-    "Until you come back.",
-    "I never really sleep.",
-    "Go on. I'll wait.",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +119,7 @@ def make_dismiss_handler(
     """
 
     async def handler(params) -> None:
-        cue = random.choice(_DISMISS_CUES)
         await sleep_now_fn()
-        await params.result_callback({"status": "dismissed", "cue": cue})
+        await params.result_callback({"status": "dismissed"})
 
     return handler

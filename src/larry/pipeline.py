@@ -415,13 +415,21 @@ async def run() -> None:
     system_prompt = _load_system_prompt(cfg.personality_path, cfg.self_layer_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
     _tool_fns: list = []
+    _custom_tool_fns: list = []
     if cfg.self_evolution_enabled:
-        _tool_fns.extend(self_layer.build_self_tool().standard_tools)
+        _schema = self_layer.build_self_tool()
+        _tool_fns.extend(_schema.standard_tools)
+        _custom_tool_fns.extend(getattr(_schema, "custom_tools", None) or [])
     if cfg.voice_tools_enabled:
-        _tool_fns.extend(voice_enroll.build_voice_tools().standard_tools)
-    if _tool_fns:
+        _schema = voice_enroll.build_voice_tools()
+        _tool_fns.extend(_schema.standard_tools)
+        _custom_tool_fns.extend(getattr(_schema, "custom_tools", None) or [])
+    if _tool_fns or _custom_tool_fns:
         from pipecat.adapters.schemas.tools_schema import ToolsSchema
-        context.set_tools(ToolsSchema(standard_tools=_tool_fns))
+        _tools_kwargs: dict = {"standard_tools": _tool_fns}
+        if _custom_tool_fns:
+            _tools_kwargs["custom_tools"] = _custom_tool_fns
+        context.set_tools(ToolsSchema(**_tools_kwargs))
 
     # Barge-in / mute policy.  AlwaysUserMuteStrategy suppresses VAD /
     # transcription / interruption frames while the bot is speaking — needed on
@@ -650,13 +658,8 @@ async def run() -> None:
             voice_enroll.make_enroll_speaker_handler(arm_capture_fn=_arm_capture),
         )
 
-        # dismiss: play a cue + send the gate to sleep.
+        # dismiss: delegate entirely to sleep_now() → _on_sleep fires the cue.
         async def _sleep_now() -> None:
-            line = random.choice(voice_enroll._DISMISS_CUES)
-            logger.info("Dismiss cue: %r", line)
-            t = asyncio.create_task(_play_cue(line))
-            _cue_tasks.add(t)
-            t.add_done_callback(_cue_tasks.discard)
             wake_gate.sleep_now()
 
         llm.register_function(

@@ -21,6 +21,8 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from resemblyzer import VoiceEncoder
 
+from larry.voice_enroll import SAMPLE_RATE
+
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """Return cosine similarity between two vectors in [-1, 1]."""
@@ -86,7 +88,7 @@ class SpeakerIDProcessor(FrameProcessor):
         self._db_path = speakers_db_path
         self._on_speaker_change = on_speaker_change
         self._match_threshold = match_threshold
-        self._window_bytes = int(16000 * 2 * window_seconds)  # 16kHz int16 bytes
+        self._window_bytes = int(SAMPLE_RATE * 2 * window_seconds)  # 16kHz int16 bytes
 
         self._enrolled: dict[str, np.ndarray] = load_enrolled(speakers_db_path)
         self._encoder: VoiceEncoder = VoiceEncoder()  # blocks on torch load — fail fast
@@ -134,11 +136,16 @@ class SpeakerIDProcessor(FrameProcessor):
                 # safe for concurrent calls, and "who is speaking right now"
                 # is fine to sample every couple seconds rather than every
                 # 1s window.
-                if self._identify_task is None or self._identify_task.done():
+                # Also skip identification while enrollment is in progress —
+                # both paths call the same torch encoder and it is not
+                # concurrency-safe.  Identifying during enrollment is pointless.
+                if (self._capture_state == "idle") and (
+                    self._identify_task is None or self._identify_task.done()
+                ):
                     self._identify_task = asyncio.create_task(
                         asyncio.to_thread(self._identify_speaker, window)
                     )
-            # Feed capture accumulator (if armed/capturing) for every raw frame.
+            # Feed capture accumulator (if capturing) for every raw frame.
             if self._capture_state == "capturing":
                 result = self.add_capture_audio(
                     frame.audio,
@@ -146,14 +153,14 @@ class SpeakerIDProcessor(FrameProcessor):
                     bot_speaking=self._bot_speaking_for_capture,
                 )
                 if result is not None:
-                    # Capture finished asynchronously — the enroll_speaker tool
-                    # result callback already fired "pending"; speak the outcome
-                    # now via TTSSpeakFrame so Larry confirms to the user.
                     from larry.voice_enroll import ENROLL_CONFIRM, ENROLL_FAIL
 
-                    line = ENROLL_CONFIRM if result["status"] == "enrolled" else ENROLL_FAIL
-                    logger.info("Capture result: %s — speaking %r", result, line)
-                    await self.push_frame(TTSSpeakFrame(line), direction)
+                    if result["status"] == "ready":
+                        await self.finalize_capture(result["name"], result["audio"])
+                        await self.push_frame(TTSSpeakFrame(ENROLL_CONFIRM), direction)
+                    else:
+                        # "abort"
+                        await self.push_frame(TTSSpeakFrame(ENROLL_FAIL), direction)
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, BotStartedSpeakingFrame):
@@ -263,59 +270,99 @@ class SpeakerIDProcessor(FrameProcessor):
     ) -> dict | None:
         """Feed a chunk of PCM audio into the capture accumulator.
 
-        Returns a result dict ``{"status": "enrolled", "name": ...}`` on
-        success, ``{"status": "failed", "reason": ...}`` on abort, or ``None``
-        if still accumulating.  Only counts frames that are VAD-voiced AND bot-
-        silent. Called from ``process_frame`` (or directly in tests).
+        Returns one of:
+          - ``None`` — still capturing
+          - ``{"status": "ready",  "name": ..., "audio": <float32 ndarray>}``
+            — enough voiced audio collected; caller must embed+store via
+            ``finalize_capture``.
+          - ``{"status": "abort",  "name": ..., "reason": ...}``
+            — wall-clock cap expired with insufficient voiced audio; give up.
+
+        On returning "ready" or "abort" the capture state transitions out of
+        "capturing" so further frames are ignored.  Only VAD-voiced AND bot-
+        silent audio is accumulated.  Called from ``process_frame`` (or
+        directly in tests).
         """
         if self._capture_state != "capturing":
             return None
 
         elapsed = _monotonic() - self._capture_start
-        voiced_s = self._capture_voiced_bytes / (16000 * 2)  # int16 bytes → seconds
+        voiced_s = self._capture_voiced_bytes / (SAMPLE_RATE * 2)  # int16 bytes → seconds
 
-        # Cap exceeded with insufficient voiced audio → abort.
-        if elapsed >= self._capture_cap_wall_s and voiced_s < self._capture_floor_voiced_s:
-            logger.warning(
-                "Capture aborted for %r: %.1fs voiced in %.1fs (floor=%.1fs, cap=%.1fs)",
-                self._capture_name,
-                voiced_s,
-                elapsed,
-                self._capture_floor_voiced_s,
-                self._capture_cap_wall_s,
-            )
-            reason = (
-                f"insufficient voiced audio ({voiced_s:.1f}s < "
-                f"{self._capture_floor_voiced_s:.1f}s floor)"
-            )
-            self._capture_state = "idle"
-            return {"status": "failed", "name": self._capture_name, "reason": reason}
+        # Wall-clock cap: always terminate when elapsed >= cap.
+        if elapsed >= self._capture_cap_wall_s:
+            name = self._capture_name
+            if voiced_s >= self._capture_floor_voiced_s:
+                # Floor met — encode what we have.
+                audio = pcm16_to_float32(bytes(self._capture_bytes))
+                self._capture_state = "embedding"
+                logger.info(
+                    "Capture cap reached for %r: %.1fs voiced — ready (>= floor %.1fs)",
+                    name,
+                    voiced_s,
+                    self._capture_floor_voiced_s,
+                )
+                return {"status": "ready", "name": name, "audio": audio}
+            else:
+                # Insufficient audio — abort.
+                self._capture_state = "idle"
+                reason = (
+                    f"insufficient voiced audio ({voiced_s:.1f}s < "
+                    f"{self._capture_floor_voiced_s:.1f}s floor)"
+                )
+                logger.warning(
+                    "Capture aborted for %r: %.1fs voiced in %.1fs (floor=%.1fs, cap=%.1fs)",
+                    name,
+                    voiced_s,
+                    elapsed,
+                    self._capture_floor_voiced_s,
+                    self._capture_cap_wall_s,
+                )
+                return {"status": "abort", "name": name, "reason": reason}
 
         # Only accumulate bot-silent, VAD-voiced audio.
         if vad_voiced and not bot_speaking:
             self._capture_bytes.extend(pcm_bytes)
             self._capture_voiced_bytes += len(pcm_bytes)
 
-        voiced_s = self._capture_voiced_bytes / (16000 * 2)
+        voiced_s = self._capture_voiced_bytes / (SAMPLE_RATE * 2)
 
-        # Target reached → embed + persist.
+        # Target voiced duration reached → ready to embed.
         if voiced_s >= self._capture_target_voiced_s:
             name = self._capture_name
-            embed_fn = self._capture_embed_fn
-            db_path = self._capture_db_path
             audio = pcm16_to_float32(bytes(self._capture_bytes))
-            self._capture_state = "idle"
-
-            if embed_fn is None or db_path is None:
-                return {"status": "failed", "name": name, "reason": "embed_fn or db_path missing"}
-
-            embedding = np.asarray(embed_fn(audio))
-            store_speaker(db_path, name, embedding)
-            # Reload in-memory enrolled set so new speaker is immediately identifiable.
-            self._enrolled = load_enrolled(db_path)
-            logger.info("Enrolled %r — %d speaker(s) now enrolled", name, len(self._enrolled))
-            if self._on_speaker_change:
-                self._on_speaker_change(name)
-            return {"status": "enrolled", "name": name}
+            self._capture_state = "embedding"
+            logger.info(
+                "Capture target reached for %r (%.1fs voiced)", name, voiced_s
+            )
+            return {"status": "ready", "name": name, "audio": audio}
 
         return None
+
+    async def finalize_capture(self, name: str, audio: np.ndarray) -> dict:
+        """Embed and persist a completed capture, off the event loop.
+
+        Runs the Resemblyzer encode in a thread via ``asyncio.to_thread`` so
+        the torch encoder never blocks the pipeline event loop.  Reloads the
+        in-memory enrolled set so the new speaker is immediately identifiable,
+        fires ``_on_speaker_change`` if set, and returns
+        ``{"status": "enrolled", "name": name}``.
+
+        Must only be called after ``add_capture_audio`` returns "ready".
+        """
+        embed_fn = self._capture_embed_fn
+        db_path = self._capture_db_path
+
+        if embed_fn is None or db_path is None:
+            self._capture_state = "idle"
+            return {"status": "failed", "name": name, "reason": "embed_fn or db_path missing"}
+
+        embedding = np.asarray(await asyncio.to_thread(embed_fn, audio))
+        store_speaker(db_path, name, embedding)
+        # Reload in-memory enrolled set so new speaker is immediately identifiable.
+        self._enrolled = load_enrolled(db_path)
+        logger.info("Enrolled %r — %d speaker(s) now enrolled", name, len(self._enrolled))
+        if self._on_speaker_change:
+            self._on_speaker_change(name)
+        self._capture_state = "idle"
+        return {"status": "enrolled", "name": name}

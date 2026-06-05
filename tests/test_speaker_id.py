@@ -228,7 +228,9 @@ def test_unvoiced_audio_not_accumulated(monkeypatch, tmp_path):
     assert proc._capture_voiced_bytes == 0
 
 
-def test_successful_capture_stores_and_returns_success(monkeypatch, tmp_path):
+def test_successful_capture_returns_ready_and_finalize_stores(monkeypatch, tmp_path):
+    """add_capture_audio returns 'ready'; finalize_capture stores and fires callback."""
+    import asyncio
     db = tmp_path / "speakers.db"
     fixed_emb = np.array([0.7, 0.3], dtype=np.float32)
     completed: list[str] = []
@@ -243,17 +245,26 @@ def test_successful_capture_stores_and_returns_success(monkeypatch, tmp_path):
     )
     proc.bot_stopped_speaking()
 
-    # Feed 2.5 s of voiced audio in small chunks.
+    # Feed 2.5 s of voiced audio in small chunks until add_capture_audio returns "ready".
     chunk = _pcm_bytes(0.5)
-    results: list[dict] = []
+    ready_result: dict | None = None
     for _ in range(5):
         r = proc.add_capture_audio(chunk, vad_voiced=True, bot_speaking=False)
         if r is not None:
-            results.append(r)
+            ready_result = r
+            break
 
-    assert results, "capture should have completed"
-    assert results[0]["status"] == "enrolled"
-    assert results[0]["name"] == "jason"
+    assert ready_result is not None, "capture should have signalled ready"
+    assert ready_result["status"] == "ready"
+    assert ready_result["name"] == "jason"
+    assert "audio" in ready_result
+    # State transitions to "embedding" while finalize hasn't run yet.
+    assert proc._capture_state == "embedding"
+
+    # finalize_capture does the embed+store off the loop.
+    final = asyncio.run(proc.finalize_capture(ready_result["name"], ready_result["audio"]))
+    assert final["status"] == "enrolled"
+    assert final["name"] == "jason"
     assert "jason" in load_enrolled(db)
     assert completed == ["jason"]   # on_speaker_change fired
     assert proc._capture_state == "idle"
@@ -284,6 +295,51 @@ def test_abort_when_wall_clock_cap_expires_with_insufficient_voiced(monkeypatch,
     result = proc.add_capture_audio(_pcm_bytes(2.0), vad_voiced=True, bot_speaking=False)
 
     assert result is not None
-    assert result["status"] == "failed"
+    assert result["status"] == "abort"
     assert "jason" not in load_enrolled(db)   # nothing written
     assert proc._capture_state == "idle"
+
+
+def test_cap_with_floor_met_returns_ready(monkeypatch, tmp_path):
+    """FIX B: when cap expires but voiced >= floor, return 'ready' (not stuck)."""
+    import asyncio
+    db = tmp_path / "speakers.db"
+    fixed_emb = np.array([0.7, 0.3], dtype=np.float32)
+    completed: list[str] = []
+
+    proc = _make_proc(monkeypatch, tmp_path, on_speaker_change=completed.append)
+    import larry.speaker_id as sid_mod
+    fake_time = [0.0]
+    monkeypatch.setattr(sid_mod, "_monotonic", lambda: fake_time[0])
+
+    proc.arm_capture(
+        "jason",
+        embed_fn=lambda audio: fixed_emb,
+        db_path=db,
+        target_voiced_s=10.0,  # high — won't be reached via audio alone
+        floor_voiced_s=6.0,
+        cap_wall_s=20.0,
+    )
+    proc.bot_stopped_speaking()
+
+    # Feed 7s of voiced audio (>= 6s floor, < 10s target).
+    chunk = _pcm_bytes(0.5)
+    for _ in range(14):  # 14 × 0.5s = 7s voiced
+        proc.add_capture_audio(chunk, vad_voiced=True, bot_speaking=False)
+    # No result yet — time not past cap.
+    assert proc._capture_state == "capturing"
+
+    # Now advance time past cap — next frame should return "ready".
+    fake_time[0] = 25.0  # past 20s cap
+    result = proc.add_capture_audio(_pcm_bytes(0.1), vad_voiced=True, bot_speaking=False)
+
+    assert result is not None
+    assert result["status"] == "ready", f"expected ready, got {result!r}"
+    assert result["name"] == "jason"
+    assert proc._capture_state == "embedding"
+
+    # Confirm finalize works end-to-end.
+    final = asyncio.run(proc.finalize_capture(result["name"], result["audio"]))
+    assert final["status"] == "enrolled"
+    assert "jason" in load_enrolled(db)
+    assert completed == ["jason"]

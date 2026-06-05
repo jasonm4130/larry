@@ -20,6 +20,11 @@ class Config:
     # Default depends on which provider is active: grok-4.20-non-reasoning for
     # xAI direct, anthropic/claude-sonnet-4-6 for OpenRouter.  Override via LLM_MODEL.
     llm_model: str
+    # STT provider: "groq" (segmented, per-VAD-turn — default) or "xai" (streaming).
+    # xAI streaming STT shares one WebSocket session across turns and carries the
+    # previous utterance's transcript into the next (the "looping" bug), so Groq
+    # is the safe default even when XAI_API_KEY is set for the chat LLM.
+    stt_provider: str
     groq_api_key: str
     elevenlabs_api_key: str
     elevenlabs_voice_id: str
@@ -153,6 +158,7 @@ def load_config() -> Config:
         openrouter_base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         xai_api_key=xai_api_key,
         llm_model=os.environ.get("LLM_MODEL", default_llm),
+        stt_provider=os.environ.get("STT_PROVIDER", "groq").strip().lower(),
         groq_api_key=_require("GROQ_API_KEY"),
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),

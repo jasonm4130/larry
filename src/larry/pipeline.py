@@ -350,18 +350,21 @@ async def run() -> None:
     # ------------------------------------------------------------------
     # STT / LLM / TTS
     # ------------------------------------------------------------------
-    # STT path: xAI direct (streaming WebSocket) preferred — far lower
-    # hallucination rate than Whisper and correct mute behavior under
-    # STTMuteOnBotSpeech (xAI's WebsocketSTTService honors `_muted`, unlike
-    # Groq's SegmentedSTTService).  Falls back to Whisper via Groq when
-    # XAI_API_KEY is unset; that path uses MutedGroqSTTService + the
+    # STT path is selected by STT_PROVIDER (default "groq"). Groq is segmented:
+    # it transcribes exactly the VAD-delimited audio buffer per turn, so each
+    # transcript is bounded to its own turn. xAI direct is one streaming
+    # WebSocket shared across turns — it carries the previous utterance's
+    # transcript into the next (the "looping" bug, confirmed on hardware
+    # 2026-06-05), so it is opt-in (STT_PROVIDER=xai) despite its lower
+    # hallucination rate and faster TTFT. The Groq path pairs with
+    # MutedGroqSTTService (Groq's SegmentedSTTService ignores `_muted`) + the
     # WhisperHallucinationFilter (verbose_json per-segment drops + static
-    # denylist) to mitigate hallucinations at the source.
-    if cfg.xai_api_key:
+    # denylist) to mute correctly and mitigate hallucinations at the source.
+    if cfg.stt_provider == "xai" and cfg.xai_api_key:
         logger.info("STT: xAI direct (streaming)")
         stt = XAISTTService(api_key=cfg.xai_api_key)
     else:
-        logger.info("STT: Groq Whisper-large-v3-turbo (fallback)")
+        logger.info("STT: Groq Whisper-large-v3-turbo (segmented)")
         stt = MutedGroqSTTService(
             api_key=cfg.groq_api_key,
             settings=GroqSTTService.Settings(

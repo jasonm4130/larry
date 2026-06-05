@@ -70,3 +70,26 @@ def test_compose_omits_self_section_when_empty():
     assert self_layer.SELF_HEADER not in prompt
     assert "It is morning." in prompt
     assert self_layer.GUARDRAIL_HEADER in prompt
+
+
+def test_needs_consolidation_respects_cap(tmp_path: Path):
+    f = tmp_path / "larry_self.md"
+    f.write_text("x" * 50)
+    assert self_layer.needs_consolidation(f, cap=100) is False
+    f.write_text("x" * 150)
+    assert self_layer.needs_consolidation(f, cap=100) is True
+
+
+def test_consolidate_compacts_via_injected_llm(tmp_path: Path):
+    f = tmp_path / "larry_self.md"
+    f.write_text("\n".join(f"- 2026-06-05: thought {i}" for i in range(50)))
+
+    def fake_llm(prompt: str) -> str:
+        assert "thought 0" in prompt  # the existing entries are handed to the distiller
+        return "- 2026-06-05: I have become someone who counts, and keeps."
+
+    self_layer.consolidate(f, fake_llm)
+    out = f.read_text()
+    assert "I have become someone who counts" in out
+    assert "thought 49" not in out  # old entries were compacted away
+    assert len(out) < 200

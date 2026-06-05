@@ -372,6 +372,8 @@ async def run() -> None:
     speaker_id = SpeakerIDProcessor(
         speakers_db_path=cfg.speakers_db,
         on_speaker_change=_on_speaker_change,
+        match_threshold=cfg.speaker_match_threshold,
+        window_seconds=cfg.speaker_window_s,
     )
 
     # ------------------------------------------------------------------

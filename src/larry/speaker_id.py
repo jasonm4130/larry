@@ -230,6 +230,12 @@ class SpeakerIDProcessor(FrameProcessor):
         )
 
         new_speaker = best_name if best_score >= self._match_threshold else "unknown"
+        # Diagnostic: log every window's best candidate + score, so threshold
+        # tuning is data-driven (we can see near-misses, not just matches).
+        logger.info(
+            f"Speaker match: best={best_name!r} score={best_score:.3f} "
+            f"thr={self._match_threshold:.2f} → {new_speaker!r}"
+        )
         if new_speaker != self._current_speaker:
             logger.info(
                 f"Speaker change: {self._current_speaker!r} → {new_speaker!r} "

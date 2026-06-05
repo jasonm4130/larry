@@ -236,6 +236,35 @@ def test_valid_config_constructs_without_error(required_keys):
     Config(**kwargs)
 
 
+def test_speaker_id_defaults(required_keys):
+    cfg = load_config()
+    assert cfg.speaker_match_threshold == 0.75
+    assert cfg.speaker_window_s == 1.0
+
+
+def test_speaker_id_overrides(monkeypatch, required_keys):
+    monkeypatch.setenv("SPEAKER_MATCH_THRESHOLD", "0.62")
+    monkeypatch.setenv("SPEAKER_WINDOW_S", "1.5")
+    cfg = load_config()
+    assert cfg.speaker_match_threshold == 0.62
+    assert cfg.speaker_window_s == 1.5
+
+
+@pytest.mark.parametrize(
+    ("env_var", "bad_value", "field_name"),
+    [
+        ("SPEAKER_MATCH_THRESHOLD", "1.5", "speaker_match_threshold"),
+        ("SPEAKER_MATCH_THRESHOLD", "-0.1", "speaker_match_threshold"),
+        ("SPEAKER_WINDOW_S", "0", "speaker_window_s"),
+    ],
+)
+def test_speaker_id_invalid_raises(monkeypatch, required_keys, env_var, bad_value, field_name):
+    monkeypatch.setenv(env_var, bad_value)
+    with pytest.raises(ValueError) as exc:
+        load_config()
+    assert field_name in str(exc.value)
+
+
 def test_self_evolution_defaults(monkeypatch, required_keys):
     cfg = load_config()
     assert cfg.self_layer_path.name == "larry_self.md"

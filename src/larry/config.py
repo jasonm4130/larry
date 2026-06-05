@@ -42,6 +42,10 @@ class Config:
     enable_smart_turn: bool  # layer Smart Turn v3 neural end-of-turn on top of VAD
     smart_turn_cpu_count: int  # threads for the local Smart Turn ONNX model
 
+    # Speaker identification (Resemblyzer)
+    speaker_match_threshold: float  # cosine-sim cutoff to accept an enrolled match
+    speaker_window_s: float  # audio window length (s) per identification embed
+
     # Paths
     data_dir: Path
     speakers_db: Path
@@ -111,6 +115,18 @@ class Config:
         )
         _check(self.vad_start_secs >= 0, "vad_start_secs", self.vad_start_secs, "must be >= 0")
         _check(
+            0.0 <= self.speaker_match_threshold <= 1.0,
+            "speaker_match_threshold",
+            self.speaker_match_threshold,
+            "must be in [0, 1]",
+        )
+        _check(
+            self.speaker_window_s > 0,
+            "speaker_window_s",
+            self.speaker_window_s,
+            "must be > 0",
+        )
+        _check(
             self.smart_turn_cpu_count >= 1,
             "smart_turn_cpu_count",
             self.smart_turn_cpu_count,
@@ -172,6 +188,8 @@ def load_config() -> Config:
         wake_sleep_timeout_s=float(os.environ.get("WAKE_SLEEP_TIMEOUT_S", "20")),
         enable_smart_turn=_bool("ENABLE_SMART_TURN", smart_turn_default),
         smart_turn_cpu_count=int(os.environ.get("SMART_TURN_CPU_COUNT", "2")),
+        speaker_match_threshold=float(os.environ.get("SPEAKER_MATCH_THRESHOLD", "0.75")),
+        speaker_window_s=float(os.environ.get("SPEAKER_WINDOW_S", "1.0")),
         data_dir=data_dir,
         speakers_db=data_dir / "speakers.db",
         conversations_db=data_dir / "conversations.db",

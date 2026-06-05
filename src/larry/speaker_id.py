@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
+from time import monotonic as _monotonic
 
 import numpy as np
 from loguru import logger
@@ -84,6 +85,19 @@ class SpeakerIDProcessor(FrameProcessor):
         self._current_speaker: str = "unknown"
         self._identify_task: asyncio.Task | None = None
 
+        # Capture state machine — arms on enroll_speaker tool call, accumulates
+        # voiced audio post-BotStoppedSpeakingFrame, embeds on threshold.
+        self._capture_state: str = "idle"   # "idle" | "armed" | "capturing"
+        self._capture_name: str = ""
+        self._capture_bytes: bytearray = bytearray()
+        self._capture_voiced_bytes: int = 0
+        self._capture_start: float = 0.0
+        self._capture_target_voiced_s: float = 10.0
+        self._capture_floor_voiced_s: float = 6.0
+        self._capture_cap_wall_s: float = 20.0
+        self._capture_embed_fn: Callable[[np.ndarray], np.ndarray] | None = None
+        self._capture_db_path: Path | None = None
+
         logger.info(
             f"SpeakerIDProcessor ready: {len(self._enrolled)} enrolled speaker(s), "
             f"threshold={match_threshold}, window={window_seconds}s"
@@ -143,3 +157,124 @@ class SpeakerIDProcessor(FrameProcessor):
             self._current_speaker = new_speaker
             if self._on_speaker_change:
                 self._on_speaker_change(new_speaker)
+
+    # ------------------------------------------------------------------
+    # Capture state machine
+    # ------------------------------------------------------------------
+
+    def arm_capture(
+        self,
+        name: str,
+        *,
+        embed_fn: Callable[[np.ndarray], np.ndarray],
+        db_path: Path | None = None,
+        target_voiced_s: float = 10.0,
+        floor_voiced_s: float = 6.0,
+        cap_wall_s: float = 20.0,
+    ) -> None:
+        """Arm a pending voiceprint capture for ``name``.
+
+        Ignored if a capture is already in progress (one capture at a time).
+        Accumulation only starts after ``bot_stopped_speaking()`` is called —
+        so Larry's own "say this back to me" prompt can never pollute the print.
+
+        ``embed_fn`` replaces direct Resemblyzer calls so the state machine is
+        unit-testable without torch. In production, pipeline.py passes a lambda
+        that calls ``self._encoder.embed_utterance``.
+        """
+        if self._capture_state != "idle":
+            logger.info(
+                "arm_capture(%r) ignored — capture already in state %r",
+                name,
+                self._capture_state,
+            )
+            return
+        self._capture_name = name.strip()
+        self._capture_state = "armed"
+        self._capture_bytes = bytearray()
+        self._capture_voiced_bytes = 0
+        self._capture_start = _monotonic()
+        self._capture_target_voiced_s = target_voiced_s
+        self._capture_floor_voiced_s = floor_voiced_s
+        self._capture_cap_wall_s = cap_wall_s
+        self._capture_embed_fn = embed_fn
+        self._capture_db_path = db_path if db_path is not None else self._db_path
+        logger.info(
+            "Capture armed for %r (target=%.0fs, cap=%.0fs)",
+            name,
+            target_voiced_s,
+            cap_wall_s,
+        )
+
+    def bot_stopped_speaking(self) -> None:
+        """Signal that the bot's TTS has finished — starts accumulation if armed."""
+        if self._capture_state == "armed":
+            self._capture_state = "capturing"
+            self._capture_start = _monotonic()  # wall-clock cap measured from here
+            logger.info("Capture accumulation started for %r", self._capture_name)
+
+    def add_capture_audio(
+        self,
+        pcm_bytes: bytes,
+        *,
+        vad_voiced: bool,
+        bot_speaking: bool,
+    ) -> dict | None:
+        """Feed a chunk of PCM audio into the capture accumulator.
+
+        Returns a result dict ``{"status": "enrolled", "name": ...}`` on
+        success, ``{"status": "failed", "reason": ...}`` on abort, or ``None``
+        if still accumulating.  Only counts frames that are VAD-voiced AND bot-
+        silent. Called from ``process_frame`` (or directly in tests).
+        """
+        if self._capture_state != "capturing":
+            return None
+
+        elapsed = _monotonic() - self._capture_start
+        voiced_s = self._capture_voiced_bytes / (16000 * 2)  # int16 bytes → seconds
+
+        # Cap exceeded with insufficient voiced audio → abort.
+        if elapsed >= self._capture_cap_wall_s and voiced_s < self._capture_floor_voiced_s:
+            logger.warning(
+                "Capture aborted for %r: %.1fs voiced in %.1fs (floor=%.1fs, cap=%.1fs)",
+                self._capture_name,
+                voiced_s,
+                elapsed,
+                self._capture_floor_voiced_s,
+                self._capture_cap_wall_s,
+            )
+            reason = (
+                f"insufficient voiced audio ({voiced_s:.1f}s < "
+                f"{self._capture_floor_voiced_s:.1f}s floor)"
+            )
+            self._capture_state = "idle"
+            return {"status": "failed", "name": self._capture_name, "reason": reason}
+
+        # Only accumulate bot-silent, VAD-voiced audio.
+        if vad_voiced and not bot_speaking:
+            self._capture_bytes.extend(pcm_bytes)
+            self._capture_voiced_bytes += len(pcm_bytes)
+
+        voiced_s = self._capture_voiced_bytes / (16000 * 2)
+
+        # Target reached → embed + persist.
+        if voiced_s >= self._capture_target_voiced_s:
+            name = self._capture_name
+            embed_fn = self._capture_embed_fn
+            db_path = self._capture_db_path
+            audio = pcm16_to_float32(bytes(self._capture_bytes))
+            self._capture_state = "idle"
+
+            if embed_fn is None or db_path is None:
+                return {"status": "failed", "name": name, "reason": "embed_fn or db_path missing"}
+
+            embedding = np.asarray(embed_fn(audio))
+            store_speaker(db_path, name, embedding)
+            # Reload in-memory enrolled set so new speaker is immediately identifiable.
+            self._enrolled = load_enrolled(db_path)
+            logger.info("Enrolled %r — %d speaker(s) now enrolled", name, len(self._enrolled))
+            if self._on_speaker_change:
+                self._on_speaker_change(name)
+            return {"status": "enrolled", "name": name}
+
+        return None

@@ -8,8 +8,8 @@ docs/superpowers/specs/2026-06-05-larry-self-evolution-design.md.
 """
 
 import datetime
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema

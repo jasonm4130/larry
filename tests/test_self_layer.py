@@ -59,7 +59,9 @@ def test_compose_puts_guardrails_last_even_with_adversarial_self_layer():
         guardrails=self_layer.extract_hard_constraints(_CARD),
     )
     assert prompt.rfind(self_layer.GUARDRAIL_HEADER) > prompt.rfind(adversarial)
-    assert prompt.rstrip().endswith("never use slurs.") or "never use slurs" in prompt[prompt.rfind(self_layer.GUARDRAIL_HEADER):]
+    guardrail_pos = prompt.rfind(self_layer.GUARDRAIL_HEADER)
+    after_guardrail = prompt[guardrail_pos:]
+    assert prompt.rstrip().endswith("never use slurs.") or "never use slurs" in after_guardrail
 
 
 def test_compose_omits_self_section_when_empty():
@@ -93,3 +95,33 @@ def test_consolidate_compacts_via_injected_llm(tmp_path: Path):
     assert "I have become someone who counts" in out
     assert "thought 49" not in out  # old entries were compacted away
     assert len(out) < 200
+
+
+def test_build_self_tool_shape():
+    tools = self_layer.build_self_tool()
+    fn = tools.standard_tools[0]
+    assert fn.name == "keep_about_self"
+    assert "note" in fn.to_default_dict()["parameters"]["properties"]
+    assert fn.to_default_dict()["parameters"]["required"] == ["note"]
+
+
+def test_keep_handler_appends_and_acks(tmp_path: Path):
+    f = tmp_path / "larry_self.md"
+    acked = {}
+    updated = {"n": 0}
+
+    class _Params:
+        arguments = {"note": "I keep the quiet now."}
+
+        async def result_callback(self, result):
+            acked["result"] = result
+
+    async def on_updated():
+        updated["n"] += 1
+
+    handler = self_layer.make_keep_about_self_handler(f, on_updated)
+    asyncio.run(handler(_Params()))
+
+    assert "I keep the quiet now." in f.read_text()
+    assert updated["n"] == 1
+    assert acked["result"]["status"] == "kept"

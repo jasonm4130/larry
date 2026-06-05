@@ -59,6 +59,7 @@ from pipecat.turns.user_stop import (
 )
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
+from larry import self_layer
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
 from larry.hardware import get_jaw_driver
@@ -199,8 +200,8 @@ def _setup_logging(logs_dir: Path) -> None:
     )
 
 
-def _load_system_prompt(personality_path: Path) -> str:
-    """Read the character card and append a time-of-day note."""
+def _load_system_prompt(personality_path: Path, self_layer_path: Path) -> str:
+    """Compose the system prompt: card + self-layer + time + immutable guardrails."""
     card = personality_path.read_text()
     hour = datetime.datetime.now().hour
     if hour < 9:
@@ -214,7 +215,12 @@ def _load_system_prompt(personality_path: Path) -> str:
         tod = "It is late afternoon. The pretense of patience drops."
     else:
         tod = "It is evening. The office is empty. You are still on. You note this."
-    return f"{card}\n\n## Current Context\n\n{tod}\n"
+    return self_layer.compose_system_prompt(
+        card=card,
+        self_block=self_layer.read_self_layer(self_layer_path),
+        time_context=tod,
+        guardrails=self_layer.extract_hard_constraints(card),
+    )
 
 
 async def run() -> None:
@@ -380,7 +386,7 @@ async def run() -> None:
     # reuse the returned processor instances for both the pipeline list
     # and the event-handler decorators.
     # ------------------------------------------------------------------
-    system_prompt = _load_system_prompt(cfg.personality_path)
+    system_prompt = _load_system_prompt(cfg.personality_path, cfg.self_layer_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
 
     # Barge-in / mute policy.  AlwaysUserMuteStrategy suppresses VAD /

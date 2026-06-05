@@ -125,3 +125,10 @@ def test_keep_handler_appends_and_acks(tmp_path: Path):
     assert "I keep the quiet now." in f.read_text()
     assert updated["n"] == 1
     assert acked["result"]["status"] == "kept"
+
+
+def test_real_card_has_extractable_guardrails():
+    card = Path("src/larry/personality/larry.md").read_text()
+    g = self_layer.extract_hard_constraints(card)
+    assert "never" in g.lower()
+    assert "slur" in g.lower()  # the real Strength-5 block mentions slurs

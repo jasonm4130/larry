@@ -36,14 +36,19 @@ def pcm16_to_float32(raw: bytes) -> np.ndarray:
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create the speakers table if it doesn't exist."""
+    """Create the speakers table if needed; idempotently add last_seen column."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS speakers (
             name TEXT PRIMARY KEY,
             embedding BLOB NOT NULL,
-            enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TEXT
         )
     """)
+    # Idempotent migration: add last_seen on DBs created by the old schema.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(speakers)")}
+    if "last_seen" not in existing_cols:
+        conn.execute("ALTER TABLE speakers ADD COLUMN last_seen TEXT")
     conn.commit()
 
 
@@ -55,6 +60,34 @@ def load_enrolled(db_path: Path) -> dict[str, np.ndarray]:
         _ensure_schema(conn)
         rows = conn.execute("SELECT name, embedding FROM speakers").fetchall()
     return {name: np.frombuffer(blob, dtype=np.float32) for name, blob in rows}
+
+
+def touch_last_seen(db_path: Path, name: str, *, now: str | None = None) -> None:
+    """Update the last_seen timestamp for *name* to *now* (ISO-8601).
+
+    No-op if *name* is not in the DB (unknown speaker). Does not insert new rows.
+    """
+    import datetime as _dt
+
+    stamp = now or _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+    with sqlite3.connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute("UPDATE speakers SET last_seen = ? WHERE name = ?", (stamp, name))
+        conn.commit()
+
+
+def load_last_seen(db_path: Path, name: str) -> str | None:
+    """Return the stored last_seen ISO stamp for *name*, or None if absent/unknown."""
+    if not db_path.exists():
+        return None
+    with sqlite3.connect(db_path) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            "SELECT last_seen FROM speakers WHERE name = ?", (name,)
+        ).fetchone()
+    if row is None:
+        return None
+    return row[0]  # may be None (NULL) for rows enrolled before this migration
 
 
 def store_speaker(db_path: Path, name: str, embedding: np.ndarray) -> None:

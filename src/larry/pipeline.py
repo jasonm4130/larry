@@ -42,7 +42,6 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
 )
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.audio.vad_processor import VADProcessor
@@ -67,6 +66,7 @@ from larry.memory import ConversationLog, make_memory_service
 from larry.processors import STTMuteOnBotSpeech, WhisperHallucinationFilter
 from larry.speaker_id import SpeakerIDProcessor
 from larry.stt_mute_fix import MutedGroqSTTService
+from larry.turn_taking import make_user_aggregator_params
 from larry.wake import make_wake_word_gate
 
 logger = logging.getLogger(__name__)
@@ -283,10 +283,12 @@ async def run() -> None:
     # an aggressive start_secs doesn't translate into false interruptions.
     # stop_secs must stay 0.2 — Smart Turn v3 requires it as its base window.
     #
-    # One VADParams instance, shared by the front-end VADProcessor and the
-    # aggregator's analyzer below, so the two never drift (the aggregator used
-    # to construct a bare SileroVADAnalyzer() with strict 0.6/0.7 defaults that
-    # re-rejected normal-volume desk audio the front VAD had already accepted).
+    # This is the ONLY VAD analyzer in the pipeline. The user aggregator is
+    # deliberately given no vad_analyzer of its own (see turn_taking.py): a
+    # second Silero analyzer on the same stream double-segments every turn and
+    # makes Larry react as though the speaker repeated themselves. In our pinned
+    # Pipecat (1.2.1) omitting the aggregator analyzer leaves its VADController
+    # None — it does not fall back to a strict-default analyzer.
     vad_params = VADParams(min_volume=0.1, stop_secs=0.2, start_secs=cfg.vad_start_secs)
     vad_processor = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(params=vad_params),
@@ -425,10 +427,9 @@ async def run() -> None:
 
     aggregators = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            # Share the tuned VADParams with the front-end VADProcessor so the
-            # two analyzers agree on what counts as speech.
-            vad_analyzer=SileroVADAnalyzer(params=vad_params),
+        # No vad_analyzer here — the front-end VADProcessor is the single VAD
+        # source. A second analyzer double-segments turns (the 2x-repeat bug).
+        user_params=make_user_aggregator_params(
             user_idle_timeout=cfg.idle_timeout_s,
             user_mute_strategies=user_mute_strategies,
             user_turn_strategies=user_turn_strategies,

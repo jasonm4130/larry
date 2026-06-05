@@ -196,6 +196,23 @@ class WakeWordGate(FrameProcessor):
                 await self.push_frame(frame, direction)
                 return
 
+    def sleep_now(self) -> None:
+        """Transition to the dormant/asleep state immediately (same as timeout).
+
+        Idempotent — calling while already asleep is a no-op. Fires ``on_sleep``
+        and resets the OWW prediction buffer, identical to the timeout path in
+        ``_handle_audio``.
+        """
+        if not self._awake:
+            return
+        self._awake = False
+        self._speaking = False
+        self._bot_speaking = False
+        self._model.reset()
+        logger.info("Larry going back to sleep (programmatic sleep_now).")
+        if self.on_sleep is not None:
+            self.on_sleep()
+
 
 def make_wake_word_gate(
     model_name: str = "hey_jarvis",

@@ -420,3 +420,48 @@ def test_rewakes_after_sleeping(monkeypatch):
         assert gate._awake is True
 
     _run(body)
+
+
+def test_sleep_now_transitions_to_asleep(monkeypatch):
+    async def body():
+        clock = _Clock()
+        model = _FakeModel(scores=[0.9])
+        gate, sink = await _make_gate(monkeypatch, clock, model)
+
+        # Wake first.
+        await gate.process_frame(_audio_frame(n_chunks=1), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0)
+        assert gate._awake is True
+
+        slept: list[bool] = []
+        gate.on_sleep = lambda: slept.append(True)
+
+        gate.sleep_now()
+
+        assert gate._awake is False
+        assert slept == [True]
+        # Model reset — mirrors the timeout path.
+        assert model.reset_calls == 1
+
+    _run(body)
+
+
+def test_sleep_now_idempotent_when_already_asleep(monkeypatch):
+    async def body():
+        clock = _Clock()
+        model = _FakeModel()
+        gate, sink = await _make_gate(monkeypatch, clock, model)
+
+        assert gate._awake is False
+
+        slept: list[bool] = []
+        gate.on_sleep = lambda: slept.append(True)
+
+        gate.sleep_now()
+        gate.sleep_now()
+
+        # Already asleep: on_sleep must NOT fire (no double cue), model NOT reset.
+        assert slept == []
+        assert model.reset_calls == 0
+
+    _run(body)

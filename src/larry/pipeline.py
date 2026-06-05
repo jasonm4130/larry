@@ -22,6 +22,7 @@ import logging.handlers
 import os
 import random
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -148,6 +149,26 @@ async def _presynthesize_cues(
                     e,
                 )
     return cache
+
+
+def _haiku_distill(openrouter_api_key: str, base_url: str) -> Callable[[str], str]:
+    """Return a sync prompt->text caller using OpenRouter Haiku (same model Mem0 uses)."""
+
+    def call(prompt: str) -> str:
+        r = httpx.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {openrouter_api_key}"},
+            json={
+                "model": "anthropic/claude-haiku-4-5",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+            },
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+    return call
 
 
 def _setup_logging(logs_dir: Path) -> None:
@@ -557,9 +578,24 @@ async def run() -> None:
     def _on_sleep() -> None:
         line = random.choice(_SLEEP_CUES)
         logger.info("Sleep cue: %r", line)
-        task = asyncio.create_task(_play_cue(line))
-        _cue_tasks.add(task)
-        task.add_done_callback(_cue_tasks.discard)
+        t = asyncio.create_task(_play_cue(line))
+        _cue_tasks.add(t)
+        t.add_done_callback(_cue_tasks.discard)
+
+        if cfg.self_evolution_enabled and self_layer.needs_consolidation(
+            cfg.self_layer_path, cap=cfg.self_layer_cap_chars
+        ):
+
+            async def _consolidate() -> None:
+                distill = _haiku_distill(cfg.openrouter_api_key, cfg.openrouter_base_url)
+                await asyncio.to_thread(self_layer.consolidate, cfg.self_layer_path, distill)
+                logger.info(
+                    "Self-layer consolidated (was over %d chars)", cfg.self_layer_cap_chars
+                )
+
+            ct = asyncio.create_task(_consolidate())
+            _cue_tasks.add(ct)
+            ct.add_done_callback(_cue_tasks.discard)
 
     wake_gate.on_wake = _on_wake
     wake_gate.on_sleep = _on_sleep

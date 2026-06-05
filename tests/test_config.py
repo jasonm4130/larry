@@ -249,3 +249,14 @@ def test_self_evolution_overrides(monkeypatch, required_keys):
     cfg = load_config()
     assert cfg.self_layer_cap_chars == 8000
     assert cfg.self_evolution_enabled is False
+
+
+def test_voice_tools_enabled_defaults_true(monkeypatch, required_keys):
+    cfg = load_config()
+    assert cfg.voice_tools_enabled is True
+
+
+def test_voice_tools_enabled_overridable(monkeypatch, required_keys):
+    monkeypatch.setenv("VOICE_TOOLS_ENABLED", "false")
+    cfg = load_config()
+    assert cfg.voice_tools_enabled is False

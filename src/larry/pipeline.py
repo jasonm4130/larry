@@ -26,6 +26,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
+import numpy as np
 from loguru import logger as _loguru
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -58,7 +59,7 @@ from pipecat.turns.user_stop import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 
-from larry import self_layer
+from larry import self_layer, voice_enroll
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
 from larry.hardware import get_jaw_driver
@@ -413,8 +414,22 @@ async def run() -> None:
     # ------------------------------------------------------------------
     system_prompt = _load_system_prompt(cfg.personality_path, cfg.self_layer_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+    _tool_fns: list = []
+    _custom_tool_fns: list = []
     if cfg.self_evolution_enabled:
-        context.set_tools(self_layer.build_self_tool())
+        _schema = self_layer.build_self_tool()
+        _tool_fns.extend(_schema.standard_tools)
+        _custom_tool_fns.extend(getattr(_schema, "custom_tools", None) or [])
+    if cfg.voice_tools_enabled:
+        _schema = voice_enroll.build_voice_tools()
+        _tool_fns.extend(_schema.standard_tools)
+        _custom_tool_fns.extend(getattr(_schema, "custom_tools", None) or [])
+    if _tool_fns or _custom_tool_fns:
+        from pipecat.adapters.schemas.tools_schema import ToolsSchema
+        _tools_kwargs: dict = {"standard_tools": _tool_fns}
+        if _custom_tool_fns:
+            _tools_kwargs["custom_tools"] = _custom_tool_fns
+        context.set_tools(ToolsSchema(**_tools_kwargs))
 
     # Barge-in / mute policy.  AlwaysUserMuteStrategy suppresses VAD /
     # transcription / interruption frames while the bot is speaking — needed on
@@ -625,6 +640,31 @@ async def run() -> None:
         llm.register_function(
             "keep_about_self",
             self_layer.make_keep_about_self_handler(cfg.self_layer_path, _rebuild_system_prompt),
+        )
+
+    if cfg.voice_tools_enabled:
+        # enroll_speaker: arm the capture state machine on speaker_id, which
+        # will call _on_speaker_change (mem0 user_id) on success.
+        def _arm_capture(name: str, **kwargs) -> None:
+            speaker_id.arm_capture(
+                name,
+                embed_fn=lambda audio: np.asarray(speaker_id._encoder.embed_utterance(audio)),
+                db_path=cfg.speakers_db,
+                **kwargs,
+            )
+
+        llm.register_function(
+            "enroll_speaker",
+            voice_enroll.make_enroll_speaker_handler(arm_capture_fn=_arm_capture),
+        )
+
+        # dismiss: delegate entirely to sleep_now() → _on_sleep fires the cue.
+        async def _sleep_now() -> None:
+            wake_gate.sleep_now()
+
+        llm.register_function(
+            "dismiss",
+            voice_enroll.make_dismiss_handler(sleep_now_fn=_sleep_now),
         )
 
     # ------------------------------------------------------------------

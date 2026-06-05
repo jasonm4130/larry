@@ -132,3 +132,55 @@ def test_real_card_has_extractable_guardrails():
     g = self_layer.extract_hard_constraints(card)
     assert "never" in g.lower()
     assert "slur" in g.lower()  # the real Strength-5 block mentions slurs
+
+
+# ---------------------------------------------------------------------------
+# recency_line kwarg on compose_system_prompt
+# ---------------------------------------------------------------------------
+
+_CARD = (
+    "# Larry\n\nYou are Larry.\n\n"
+    "## Hard Constraints — Strength 5 (Absolute. Non-negotiable.)\n\n"
+    "You will never use slurs.\n\n"
+    "## Soft Constraints\n\nBe warm.\n"
+)
+
+
+def test_compose_includes_recency_line_when_provided():
+    prompt = self_layer.compose_system_prompt(
+        card=_CARD,
+        self_block="",
+        time_context="It is mid-day. Standard register.",
+        guardrails=self_layer.extract_hard_constraints(_CARD),
+        recency_line="You are speaking with Jason. Last with you 4 days ago.",
+    )
+    assert "You are speaking with Jason" in prompt
+    assert "4 days ago" in prompt
+    # Recency line must be inside the ## Current Context block (before guardrails).
+    context_start = prompt.find("## Current Context")
+    guardrail_start = prompt.find(self_layer.GUARDRAIL_HEADER)
+    recency_pos = prompt.find("4 days ago")
+    assert context_start < recency_pos < guardrail_start
+
+
+def test_compose_omits_recency_block_when_none():
+    prompt = self_layer.compose_system_prompt(
+        card=_CARD,
+        self_block="",
+        time_context="It is mid-day. Standard register.",
+        guardrails=self_layer.extract_hard_constraints(_CARD),
+        recency_line=None,
+    )
+    # No stray blank speaker line should appear.
+    assert "You are speaking with" not in prompt
+
+
+def test_compose_recency_default_is_none():
+    """Calling compose_system_prompt without recency_line must not raise."""
+    prompt = self_layer.compose_system_prompt(
+        card=_CARD,
+        self_block="",
+        time_context="It is morning.",
+        guardrails=self_layer.extract_hard_constraints(_CARD),
+    )
+    assert "## Current Context" in prompt

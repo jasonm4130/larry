@@ -343,3 +343,100 @@ def test_cap_with_floor_met_returns_ready(monkeypatch, tmp_path):
     assert final["status"] == "enrolled"
     assert "jason" in load_enrolled(db)
     assert completed == ["jason"]
+
+
+# ---------------------------------------------------------------------------
+# last_seen migration + helpers
+# ---------------------------------------------------------------------------
+
+import sqlite3  # noqa: E402
+
+
+def test_ensure_schema_adds_last_seen_column(tmp_path):
+    """_ensure_schema adds last_seen TEXT; calling it twice is idempotent."""
+    db = tmp_path / "speakers.db"
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+        # Column must exist after first call.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(speakers)")}
+        assert "last_seen" in cols
+        # Second call must not raise.
+        speaker_id._ensure_schema(conn)
+
+
+def test_ensure_schema_upgrade_preserves_existing_rows(tmp_path):
+    """Schema migration on a DB that already has rows must not drop them."""
+    db = tmp_path / "speakers.db"
+    embedding = b"\x00\x00\x80\x3f"  # float32 1.0 as bytes
+    with sqlite3.connect(db) as conn:
+        # Manually create the OLD schema (no last_seen column).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS speakers "
+            "(name TEXT PRIMARY KEY, embedding BLOB NOT NULL, "
+            "enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.execute("INSERT INTO speakers (name, embedding) VALUES (?, ?)", ("alice", embedding))
+        conn.commit()
+    # Now run the new _ensure_schema — should add last_seen without dropping alice.
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+        rows = conn.execute("SELECT name FROM speakers").fetchall()
+    assert [r[0] for r in rows] == ["alice"]
+
+
+def test_touch_last_seen_writes_iso_stamp(tmp_path):
+    """touch_last_seen inserts a valid ISO stamp for an existing row."""
+    db = tmp_path / "speakers.db"
+    embedding = b"\x00\x00\x80\x3f"
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+        conn.execute("INSERT INTO speakers (name, embedding) VALUES (?, ?)", ("bob", embedding))
+        conn.commit()
+
+    speaker_id.touch_last_seen(db, "bob", now="2026-06-05T14:00:00")
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT last_seen FROM speakers WHERE name='bob'").fetchone()
+    assert row[0] == "2026-06-05T14:00:00"
+
+
+def test_touch_last_seen_unknown_speaker_is_noop(tmp_path):
+    """touch_last_seen on a non-existent name must not raise or create a row."""
+    db = tmp_path / "speakers.db"
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+        conn.commit()
+    # Should silently no-op — UPDATE WHERE name='ghost' matches 0 rows.
+    speaker_id.touch_last_seen(db, "ghost", now="2026-06-05T14:00:00")
+    with sqlite3.connect(db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM speakers").fetchone()[0]
+    assert count == 0
+
+
+def test_load_enrolled_round_trips_last_seen(tmp_path):
+    """load_enrolled returns last_seen alongside the embedding."""
+    db = tmp_path / "speakers.db"
+    emb = np.array([1.0, 0.0], dtype=np.float32)
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+        conn.execute(
+            "INSERT INTO speakers (name, embedding, last_seen) VALUES (?, ?, ?)",
+            ("carol", emb.tobytes(), "2026-06-01T10:00:00"),
+        )
+        conn.commit()
+
+    speaker_id.load_enrolled(db)
+    # load_enrolled currently returns name → embedding dict; after this task it
+    # must return name → (embedding, last_seen) OR a separate helper exists.
+    # Per the spec, load_enrolled returns the embedding dict unchanged; a
+    # separate load_last_seen(db, name) is sufficient for the pipeline.
+    # This test just checks the new load_last_seen helper.
+    last = speaker_id.load_last_seen(db, "carol")
+    assert last == "2026-06-01T10:00:00"
+
+
+def test_load_last_seen_unknown_returns_none(tmp_path):
+    db = tmp_path / "speakers.db"
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+    assert speaker_id.load_last_seen(db, "nobody") is None

@@ -52,6 +52,7 @@ class Config:
     self_layer_path: Path
     self_layer_cap_chars: int
     self_evolution_enabled: bool
+    voice_tools_enabled: bool
 
     # Servo calibration
     jaw_open_angle: int
@@ -180,6 +181,8 @@ def load_config() -> Config:
         self_layer_path=data_dir / "larry_self.md",
         self_layer_cap_chars=int(os.environ.get("SELF_LAYER_CAP_CHARS", "5000")),
         self_evolution_enabled=os.environ.get("SELF_EVOLUTION_ENABLED", "true").lower()
+        not in ("false", "0", "no"),
+        voice_tools_enabled=os.environ.get("VOICE_TOOLS_ENABLED", "true").lower()
         not in ("false", "0", "no"),
         jaw_open_angle=60,
         jaw_closed_angle=0,

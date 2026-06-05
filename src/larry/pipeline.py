@@ -388,6 +388,8 @@ async def run() -> None:
     # ------------------------------------------------------------------
     system_prompt = _load_system_prompt(cfg.personality_path, cfg.self_layer_path)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+    if cfg.self_evolution_enabled:
+        context.set_tools(self_layer.build_self_tool())
 
     # Barge-in / mute policy.  AlwaysUserMuteStrategy suppresses VAD /
     # transcription / interruption frames while the bot is speaking — needed on
@@ -561,6 +563,22 @@ async def run() -> None:
 
     wake_gate.on_wake = _on_wake
     wake_gate.on_sleep = _on_sleep
+
+    if cfg.self_evolution_enabled:
+
+        async def _rebuild_system_prompt() -> None:
+            messages = context.get_messages()
+            new_system = _load_system_prompt(cfg.personality_path, cfg.self_layer_path)
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    msg["content"] = new_system
+                    break
+            context.set_messages(messages)
+
+        llm.register_function(
+            "keep_about_self",
+            self_layer.make_keep_about_self_handler(cfg.self_layer_path, _rebuild_system_prompt),
+        )
 
     # ------------------------------------------------------------------
     # Phase 5: jaw sync — drive servo from bot audio amplitude

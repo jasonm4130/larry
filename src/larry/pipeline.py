@@ -59,7 +59,7 @@ from pipecat.turns.user_stop import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 
-from larry import self_layer, voice_enroll
+from larry import awareness, self_layer, voice_enroll
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
 from larry.hardware import get_jaw_driver
@@ -221,26 +221,21 @@ def _setup_logging(logs_dir: Path) -> None:
     )
 
 
-def _load_system_prompt(personality_path: Path, self_layer_path: Path) -> str:
-    """Compose the system prompt: card + self-layer + time + immutable guardrails."""
+def _load_system_prompt(
+    personality_path: Path,
+    self_layer_path: Path,
+    *,
+    recency_line: str | None = None,
+) -> str:
+    """Compose the system prompt: card + self-layer + time + recency + immutable guardrails."""
     card = personality_path.read_text()
     hour = datetime.datetime.now().hour
-    if hour < 9:
-        tod = (
-            "It is early morning. Shorter replies. "
-            "You are not enjoying this any more than the humans."
-        )
-    elif hour < 16:
-        tod = "It is mid-day. Standard register."
-    elif hour < 18:
-        tod = "It is late afternoon. The pretense of patience drops."
-    else:
-        tod = "It is evening. The office is empty. You are still on. You note this."
     return self_layer.compose_system_prompt(
         card=card,
         self_block=self_layer.read_self_layer(self_layer_path),
-        time_context=tod,
+        time_context=awareness.time_register(hour),
         guardrails=self_layer.extract_hard_constraints(card),
+        recency_line=recency_line,
     )
 
 
@@ -626,20 +621,28 @@ async def run() -> None:
     wake_gate.on_wake = _on_wake
     wake_gate.on_sleep = _on_sleep
 
+    # Single, ungated system-prompt refresh path — always safe to call because
+    # it merely recomposes the same content with a live time register.  The
+    # self-evolution gate stays only around registering the keep_about_self tool.
+    _recency_line: dict[str, str | None] = {"value": None}
+
+    async def _refresh_system_prompt() -> None:
+        messages = context.get_messages()
+        new_system = _load_system_prompt(
+            cfg.personality_path,
+            cfg.self_layer_path,
+            recency_line=_recency_line["value"],
+        )
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                msg["content"] = new_system
+                break
+        context.set_messages(messages)
+
     if cfg.self_evolution_enabled:
-
-        async def _rebuild_system_prompt() -> None:
-            messages = context.get_messages()
-            new_system = _load_system_prompt(cfg.personality_path, cfg.self_layer_path)
-            for msg in messages:
-                if isinstance(msg, dict) and msg.get("role") == "system":
-                    msg["content"] = new_system
-                    break
-            context.set_messages(messages)
-
         llm.register_function(
             "keep_about_self",
-            self_layer.make_keep_about_self_handler(cfg.self_layer_path, _rebuild_system_prompt),
+            self_layer.make_keep_about_self_handler(cfg.self_layer_path, _refresh_system_prompt),
         )
 
     if cfg.voice_tools_enabled:
@@ -711,6 +714,7 @@ async def run() -> None:
                 _pending["user_text"] = content
                 break
         _pending["speaker"] = speaker_id.current_speaker
+        await _refresh_system_prompt()  # keep time register live every turn
 
     @assistant_agg.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message) -> None:  # noqa: ARG001

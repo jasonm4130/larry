@@ -16,7 +16,6 @@ Pipeline order:
 """
 
 import asyncio
-import contextlib
 import datetime
 import logging
 import logging.handlers
@@ -25,6 +24,7 @@ import random
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import httpx
 import numpy as np
@@ -42,7 +42,7 @@ from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext, LLMContextMessage
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
@@ -245,6 +245,9 @@ async def run() -> None:
     """Run the voice loop. Talk to Larry; he talks back."""
     cfg = load_config()
     _setup_logging(cfg.logs_dir)
+    # Capture the running event loop once so _on_speaker_change can schedule
+    # coroutines from worker threads (asyncio.to_thread has no event loop).
+    _main_loop = asyncio.get_running_loop()
     logger.info("Larry waking up... (logs: %s)", cfg.logs_dir)
 
     # ------------------------------------------------------------------
@@ -358,10 +361,13 @@ async def run() -> None:
 
         speaker_id_module.touch_last_seen(cfg.speakers_db, new_name)
         # Schedule a prompt refresh so the new recency line lands immediately.
-        # Guard: if no event loop is running yet (shouldn't happen in normal flow),
-        # the next on_user_turn_stopped will refresh instead.
-        with contextlib.suppress(RuntimeError):
-            asyncio.create_task(_refresh_system_prompt())
+        # _on_speaker_change may be called from _identify_speaker inside
+        # asyncio.to_thread(), which runs in a worker thread with no event loop.
+        # call_soon_threadsafe schedules the refresh onto the main loop safely
+        # from any thread.
+        _main_loop.call_soon_threadsafe(
+            lambda: _main_loop.create_task(_refresh_system_prompt())
+        )
 
     speaker_id = SpeakerIDProcessor(
         speakers_db_path=cfg.speakers_db,
@@ -652,15 +658,15 @@ async def run() -> None:
     _recency_line: dict[str, str | None] = {"value": None}
 
     async def _refresh_system_prompt() -> None:
-        messages = context.get_messages()
+        messages = list(context.get_messages())
         new_system = _load_system_prompt(
             cfg.personality_path,
             cfg.self_layer_path,
             recency_line=_recency_line["value"],
         )
-        for msg in messages:
+        for i, msg in enumerate(messages):
             if isinstance(msg, dict) and msg.get("role") == "system":
-                msg["content"] = new_system
+                messages[i] = cast(LLMContextMessage, {**msg, "content": new_system})
                 break
         context.set_messages(messages)
 

@@ -59,6 +59,8 @@ def recency_phrase(last_seen: str | None, now: datetime.datetime) -> str | None:
     seen_date = seen_dt.date()
     delta_days = (now_date - seen_date).days
 
+    if delta_days < 0:
+        return "earlier today"
     if delta_days == 0:
         return "earlier today"
     if delta_days == 1:

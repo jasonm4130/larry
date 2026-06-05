@@ -97,3 +97,10 @@ def test_recency_phrase_six_to_seven_boundary():
     last_7 = (_NOW - datetime.timedelta(days=7)).isoformat()
     assert awareness.recency_phrase(last_6, _NOW) == "6 days ago"
     assert awareness.recency_phrase(last_7, _NOW) == "a while ago"
+
+
+def test_recency_phrase_future_timestamp_treated_as_now():
+    """A last_seen one day in the future (clock skew) returns 'earlier today', not '-1 days ago'."""
+    future = (_NOW + datetime.timedelta(days=1)).isoformat()
+    result = awareness.recency_phrase(future, _NOW)
+    assert result == "earlier today"

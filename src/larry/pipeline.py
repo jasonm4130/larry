@@ -42,7 +42,6 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
 )
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.audio.vad_processor import VADProcessor
@@ -57,7 +56,6 @@ from pipecat.turns.user_stop import (
     SpeechTimeoutUserTurnStopStrategy,
     TurnAnalyzerUserTurnStopStrategy,
 )
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
@@ -67,6 +65,7 @@ from larry.memory import ConversationLog, make_memory_service
 from larry.processors import STTMuteOnBotSpeech, WhisperHallucinationFilter
 from larry.speaker_id import SpeakerIDProcessor
 from larry.stt_mute_fix import MutedGroqSTTService
+from larry.turn_taking import make_user_aggregator_params, make_user_turn_strategies
 from larry.wake import make_wake_word_gate
 
 logger = logging.getLogger(__name__)
@@ -283,10 +282,12 @@ async def run() -> None:
     # an aggressive start_secs doesn't translate into false interruptions.
     # stop_secs must stay 0.2 — Smart Turn v3 requires it as its base window.
     #
-    # One VADParams instance, shared by the front-end VADProcessor and the
-    # aggregator's analyzer below, so the two never drift (the aggregator used
-    # to construct a bare SileroVADAnalyzer() with strict 0.6/0.7 defaults that
-    # re-rejected normal-volume desk audio the front VAD had already accepted).
+    # This is the ONLY VAD analyzer in the pipeline. The user aggregator is
+    # deliberately given no vad_analyzer of its own (see turn_taking.py): a
+    # second Silero analyzer on the same stream double-segments every turn and
+    # makes Larry react as though the speaker repeated themselves. In our pinned
+    # Pipecat (1.2.1) omitting the aggregator analyzer leaves its VADController
+    # None — it does not fall back to a strict-default analyzer.
     vad_params = VADParams(min_volume=0.1, stop_secs=0.2, start_secs=cfg.vad_start_secs)
     vad_processor = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(params=vad_params),
@@ -322,18 +323,21 @@ async def run() -> None:
     # ------------------------------------------------------------------
     # STT / LLM / TTS
     # ------------------------------------------------------------------
-    # STT path: xAI direct (streaming WebSocket) preferred — far lower
-    # hallucination rate than Whisper and correct mute behavior under
-    # STTMuteOnBotSpeech (xAI's WebsocketSTTService honors `_muted`, unlike
-    # Groq's SegmentedSTTService).  Falls back to Whisper via Groq when
-    # XAI_API_KEY is unset; that path uses MutedGroqSTTService + the
+    # STT path is selected by STT_PROVIDER (default "groq"). Groq is segmented:
+    # it transcribes exactly the VAD-delimited audio buffer per turn, so each
+    # transcript is bounded to its own turn. xAI direct is one streaming
+    # WebSocket shared across turns — it carries the previous utterance's
+    # transcript into the next (the "looping" bug, confirmed on hardware
+    # 2026-06-05), so it is opt-in (STT_PROVIDER=xai) despite its lower
+    # hallucination rate and faster TTFT. The Groq path pairs with
+    # MutedGroqSTTService (Groq's SegmentedSTTService ignores `_muted`) + the
     # WhisperHallucinationFilter (verbose_json per-segment drops + static
-    # denylist) to mitigate hallucinations at the source.
-    if cfg.xai_api_key:
+    # denylist) to mute correctly and mitigate hallucinations at the source.
+    if cfg.stt_provider == "xai" and cfg.xai_api_key:
         logger.info("STT: xAI direct (streaming)")
         stt = XAISTTService(api_key=cfg.xai_api_key)
     else:
-        logger.info("STT: Groq Whisper-large-v3-turbo (fallback)")
+        logger.info("STT: Groq Whisper-large-v3-turbo (segmented)")
         stt = MutedGroqSTTService(
             api_key=cfg.groq_api_key,
             settings=GroqSTTService.Settings(
@@ -405,11 +409,13 @@ async def run() -> None:
     # tunable for the Pi 5 and so it can be swapped out: when disabled we fall
     # back to pure VAD/STT-timeout endpointing (no neural model), which is the
     # A/B baseline if Smart Turn is suspected of holding turns open in noise.
-    # start strategies are left to the aggregator default (VAD + transcription).
+    # Start strategy is pinned to VAD-only via make_user_turn_strategies — leaving
+    # it at the aggregator default (VAD + transcription) is the 2x-repeat bug:
+    # streaming STT's late transcription opens a duplicate turn. See turn_taking.py.
     if cfg.enable_smart_turn:
         from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 
-        user_turn_strategies = UserTurnStrategies(
+        user_turn_strategies = make_user_turn_strategies(
             stop=[
                 TurnAnalyzerUserTurnStopStrategy(
                     turn_analyzer=LocalSmartTurnAnalyzerV3(cpu_count=cfg.smart_turn_cpu_count),
@@ -418,17 +424,16 @@ async def run() -> None:
         )
         logger.info("End-of-turn: Smart Turn v3 (cpu_count=%d)", cfg.smart_turn_cpu_count)
     else:
-        user_turn_strategies = UserTurnStrategies(
+        user_turn_strategies = make_user_turn_strategies(
             stop=[SpeechTimeoutUserTurnStopStrategy()],
         )
         logger.info("End-of-turn: VAD/STT-timeout only (Smart Turn disabled)")
 
     aggregators = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            # Share the tuned VADParams with the front-end VADProcessor so the
-            # two analyzers agree on what counts as speech.
-            vad_analyzer=SileroVADAnalyzer(params=vad_params),
+        # No vad_analyzer here — the front-end VADProcessor is the single VAD
+        # source. A second analyzer double-segments turns (the 2x-repeat bug).
+        user_params=make_user_aggregator_params(
             user_idle_timeout=cfg.idle_timeout_s,
             user_mute_strategies=user_mute_strategies,
             user_turn_strategies=user_turn_strategies,

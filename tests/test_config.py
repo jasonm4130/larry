@@ -124,6 +124,22 @@ def test_smart_turn_default_false_otherwise(monkeypatch, required_keys):
     assert load_config().enable_smart_turn is False
 
 
+# --- STT provider selection ------------------------------------------------
+
+
+def test_stt_provider_defaults_to_groq(monkeypatch, required_keys):
+    # xAI streaming STT carries transcripts across VAD turns (the loop bug), so
+    # Groq segmented STT is the safe default even when XAI_API_KEY is set.
+    monkeypatch.delenv("STT_PROVIDER", raising=False)
+    monkeypatch.setenv("XAI_API_KEY", "xai-key")
+    assert load_config().stt_provider == "groq"
+
+
+def test_stt_provider_override_xai_normalized(monkeypatch, required_keys):
+    monkeypatch.setenv("STT_PROVIDER", "  XAI  ")
+    assert load_config().stt_provider == "xai"
+
+
 # --- ElevenLabs voice / model defaults -------------------------------------
 
 

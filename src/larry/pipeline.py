@@ -159,7 +159,7 @@ def _haiku_distill(openrouter_api_key: str, base_url: str) -> Callable[[str], st
             f"{base_url}/chat/completions",
             headers={"Authorization": f"Bearer {openrouter_api_key}"},
             json={
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-4.5",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
             },
@@ -587,11 +587,17 @@ async def run() -> None:
         ):
 
             async def _consolidate() -> None:
-                distill = _haiku_distill(cfg.openrouter_api_key, cfg.openrouter_base_url)
-                await asyncio.to_thread(self_layer.consolidate, cfg.self_layer_path, distill)
-                logger.info(
-                    "Self-layer consolidated (was over %d chars)", cfg.self_layer_cap_chars
-                )
+                try:
+                    distill = _haiku_distill(cfg.openrouter_api_key, cfg.openrouter_base_url)
+                    await asyncio.to_thread(self_layer.consolidate, cfg.self_layer_path, distill)
+                    logger.info(
+                        "Self-layer consolidated (was over %d chars)", cfg.self_layer_cap_chars
+                    )
+                except Exception:
+                    # Non-fatal: the self-layer file is left intact (consolidate only
+                    # rewrites on a non-empty distillation), so Larry keeps evolving;
+                    # we just stay over cap until the next sleep. Surface it, don't crash.
+                    logger.warning("Self-layer consolidation failed", exc_info=True)
 
             ct = asyncio.create_task(_consolidate())
             _cue_tasks.add(ct)

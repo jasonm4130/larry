@@ -1,5 +1,8 @@
 """Tests for larry.awareness — pure time and recency helpers."""
 
+import datetime
+from datetime import datetime as dt
+
 import pytest
 
 from larry import awareness
@@ -38,3 +41,59 @@ def test_time_register_returns_string_not_multiline():
     """Each bucket is a single prose line (no embedded newlines that break context layout)."""
     for hour in range(24):
         assert "\n" not in awareness.time_register(hour)
+
+
+# ---------------------------------------------------------------------------
+# recency_phrase
+# ---------------------------------------------------------------------------
+
+_NOW = dt(2026, 6, 5, 14, 0, 0, tzinfo=datetime.UTC)
+
+
+def test_recency_phrase_none_input_returns_none():
+    """Unknown speaker (no stored timestamp) → None; caller decides phrasing."""
+    assert awareness.recency_phrase(None, _NOW) is None
+
+
+def test_recency_phrase_same_day():
+    last = dt(2026, 6, 5, 9, 30, 0, tzinfo=datetime.UTC).isoformat()
+    assert awareness.recency_phrase(last, _NOW) == "earlier today"
+
+
+def test_recency_phrase_yesterday():
+    last = dt(2026, 6, 4, 20, 0, 0, tzinfo=datetime.UTC).isoformat()
+    assert awareness.recency_phrase(last, _NOW) == "yesterday"
+
+
+@pytest.mark.parametrize("days_ago", [2, 3, 6])
+def test_recency_phrase_n_days_ago(days_ago: int):
+    last = (_NOW - datetime.timedelta(days=days_ago)).isoformat()
+    result = awareness.recency_phrase(last, _NOW)
+    assert result == f"{days_ago} days ago"
+
+
+def test_recency_phrase_seven_days_is_weeks():
+    last = (_NOW - datetime.timedelta(days=7)).isoformat()
+    result = awareness.recency_phrase(last, _NOW)
+    assert result == "a while ago"
+
+
+def test_recency_phrase_many_weeks():
+    last = (_NOW - datetime.timedelta(days=30)).isoformat()
+    result = awareness.recency_phrase(last, _NOW)
+    assert result == "a while ago"
+
+
+def test_recency_phrase_midnight_boundary():
+    """A timestamp from 23:59 yesterday with now at 00:01 today is 'yesterday'."""
+    now_midnight = dt(2026, 6, 5, 0, 1, 0, tzinfo=datetime.UTC)
+    last = dt(2026, 6, 4, 23, 59, 0, tzinfo=datetime.UTC).isoformat()
+    assert awareness.recency_phrase(last, now_midnight) == "yesterday"
+
+
+def test_recency_phrase_six_to_seven_boundary():
+    """6 days ago → 'N days ago'; 7 days ago → 'a while ago'."""
+    last_6 = (_NOW - datetime.timedelta(days=6)).isoformat()
+    last_7 = (_NOW - datetime.timedelta(days=7)).isoformat()
+    assert awareness.recency_phrase(last_6, _NOW) == "6 days ago"
+    assert awareness.recency_phrase(last_7, _NOW) == "a while ago"

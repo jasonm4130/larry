@@ -55,7 +55,7 @@ def test_default_llm_without_xai(monkeypatch, required_keys):
     monkeypatch.delenv("LLM_MODEL", raising=False)
     cfg = load_config()
     assert cfg.xai_api_key is None
-    assert cfg.llm_model == "anthropic/claude-sonnet-4-6"
+    assert cfg.llm_model == "anthropic/claude-sonnet-5"
 
 
 def test_default_llm_with_xai(monkeypatch, required_keys):
@@ -148,7 +148,7 @@ def test_elevenlabs_defaults(monkeypatch, required_keys):
     monkeypatch.delenv("ELEVENLABS_MODEL", raising=False)
     cfg = load_config()
     assert cfg.elevenlabs_voice_id == "cPoqAvGWCPfCfyPMwe4z"
-    assert cfg.elevenlabs_model == "eleven_turbo_v2_5"
+    assert cfg.elevenlabs_model == "eleven_flash_v2_5"
 
 
 def test_elevenlabs_overrides(monkeypatch, required_keys):

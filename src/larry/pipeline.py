@@ -77,7 +77,7 @@ logger = logging.getLogger(__name__)
 
 
 # In-character spontaneous utterances for proactive idle moments.
-# Plain text only — `eleven_turbo_v2_5` reads bracket tags aloud as words.
+# Plain text only — `eleven_flash_v2_5` reads bracket tags aloud as words.
 _PROACTIVE_LINES: list[str] = [
     "Still here. I'm always still here.",
     "The office is very quiet. I can hear it.",

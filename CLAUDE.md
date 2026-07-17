@@ -14,7 +14,7 @@ LocalAudioTransport
   → SpeakerID (Resemblyzer)
   → GroqSTT
   → Mem0 (short-term memory)
-  → OpenAILLM (via OpenRouter → Claude Sonnet 4.6)
+  → OpenAILLM (via OpenRouter → Claude Sonnet 5)
   → ElevenLabsTTS
   → AudioBufferProcessor (tap for jaw sync)
   → transport.output
@@ -65,7 +65,7 @@ macOS = dev, Pi 5 = production.
 - **XAI_API_KEY** *(optional, preferred)*: when set, the main chat LLM routes direct to xAI (`grok-4.20-non-reasoning` default — ~600ms TTFT, ~20× cheaper than Claude per May 2026 research). Falls back to OpenRouter if unset.
 - **OPENROUTER_API_KEY**: always required for Mem0 fact extraction (Claude Haiku 4.5). Also serves the main chat LLM if XAI_API_KEY is unset.
 - **GROQ_API_KEY**: Groq Whisper-large-v3-turbo (STT).
-- **ELEVENLABS_API_KEY**: ElevenLabs `eleven_turbo_v2_5` (TTS, voice `cPoqAvGWCPfCfyPMwe4z`).
+- **ELEVENLABS_API_KEY**: ElevenLabs `eleven_flash_v2_5` (TTS, voice `cPoqAvGWCPfCfyPMwe4z`).
 
 Wake word runs locally via OpenWakeWord (Apache-2.0) — no API key required.
 
@@ -73,7 +73,7 @@ Embeddings (Mem0 vector layer) run locally via FastEmbed (BAAI/bge-small-en-v1.5
 
 ## Pipecat-Specific Gotchas
 
-- Default LLM model depends on which provider is active: `grok-4.20-non-reasoning` via `GrokLLMService` when `XAI_API_KEY` is set (preferred path), else `anthropic/claude-sonnet-4-6` via `OpenAILLMService` + OpenRouter. Override with `LLM_MODEL` env var; model name semantics differ by provider (prefixed `x-ai/grok-...` for OpenRouter, plain `grok-4.20-non-reasoning` for direct xAI).
+- Default LLM model depends on which provider is active: `grok-4.20-non-reasoning` via `GrokLLMService` when `XAI_API_KEY` is set (preferred path), else `anthropic/claude-sonnet-5` via `OpenAILLMService` + OpenRouter. Override with `LLM_MODEL` env var; model name semantics differ by provider (prefixed `x-ai/grok-...` for OpenRouter, plain `grok-4.20-non-reasoning` for direct xAI).
 - Proactive utterances (speak outside pipeline flow): `await task.queue_frame(TTSSpeakFrame("..."))`
 - User idle detection: `UserIdleProcessor` from `pipecat.processors.user_idle_processor` (NOT a transport hook).
 - Jaw sync: `AudioBufferProcessor` after TTS, register `@event_handler("on_track_audio_data")`, consume `bot_audio` (not `user_audio`).

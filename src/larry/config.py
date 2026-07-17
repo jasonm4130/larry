@@ -27,7 +27,7 @@ class Config:
     # Mem0's fact-extraction LLM still uses OpenRouter regardless.
     xai_api_key: str | None
     # Default depends on which provider is active: grok-4.20-non-reasoning for
-    # xAI direct, anthropic/claude-sonnet-4-6 for OpenRouter.  Override via LLM_MODEL.
+    # xAI direct, anthropic/claude-sonnet-5 for OpenRouter.  Override via LLM_MODEL.
     llm_model: str
     # STT provider: "groq" (segmented, per-VAD-turn — default) or "xai" (streaming).
     # xAI streaming STT shares one WebSocket session across turns and carries the
@@ -37,7 +37,7 @@ class Config:
     groq_api_key: str
     elevenlabs_api_key: str
     elevenlabs_voice_id: str
-    elevenlabs_model: str  # default eleven_turbo_v2_5; v3 needs alpha access
+    elevenlabs_model: str  # default eleven_flash_v2_5; v3 needs alpha access
 
     # Hardware
     larry_hardware: str
@@ -178,9 +178,9 @@ def load_config() -> Config:
 
     xai_api_key = os.environ.get("XAI_API_KEY")
     # Default model depends on active provider — xAI's grok-4.20 non-reasoning
-    # variant is the fast/cheap pick when routing direct, Claude Sonnet 4.6
+    # variant is the fast/cheap pick when routing direct, Claude Sonnet 5
     # remains the OpenRouter fallback.
-    default_llm = "grok-4.20-non-reasoning" if xai_api_key else "anthropic/claude-sonnet-4-6"
+    default_llm = "grok-4.20-non-reasoning" if xai_api_key else "anthropic/claude-sonnet-5"
 
     return Config(
         openrouter_api_key=_require("OPENROUTER_API_KEY"),
@@ -191,7 +191,7 @@ def load_config() -> Config:
         groq_api_key=_require("GROQ_API_KEY"),
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),
-        elevenlabs_model=os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
+        elevenlabs_model=os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5"),
         larry_hardware=larry_hardware,
         wake_word_model=os.environ.get("WAKE_WORD_MODEL", "hey_jarvis"),
         wake_word_custom_path=os.environ.get("WAKE_WORD_CUSTOM_PATH")

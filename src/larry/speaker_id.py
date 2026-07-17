@@ -1,4 +1,8 @@
-"""Speaker identification layer for Larry using Resemblyzer voice embeddings."""
+"""Speaker identification layer for Larry, built on the SpeakerEmbedder interface.
+
+The embedding model (Resemblyzer today; see speaker_embedder.py) is swappable
+via SPEAKER_EMBEDDER — this module never calls a specific model's SDK.
+"""
 
 import asyncio
 import sqlite3
@@ -19,8 +23,8 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from resemblyzer import VoiceEncoder
 
+from larry.speaker_embedder import SpeakerEmbedder, get_speaker_embedder
 from larry.voice_enroll import SAMPLE_RATE
 
 
@@ -36,29 +40,55 @@ def pcm16_to_float32(raw: bytes) -> np.ndarray:
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create the speakers table if needed; idempotently add last_seen column."""
+    """Create the speakers table if needed; idempotently add later-added columns.
+
+    ``embedder`` + ``dim`` namespace each voiceprint to the model that produced
+    it — a different embedder is a different vector space (and often a
+    different dimensionality), so a print must never be cosine-matched across
+    embedders (see ``load_enrolled``'s ``embedder`` filter). Rows written
+    before this migration default to 'resemblyzer'/256 — the only embedder
+    ever shipped before it — so existing installs keep matching unmigrated.
+    """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS speakers (
             name TEXT PRIMARY KEY,
             embedding BLOB NOT NULL,
             enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_seen TEXT
+            last_seen TEXT,
+            embedder TEXT NOT NULL DEFAULT 'resemblyzer',
+            dim INTEGER NOT NULL DEFAULT 256
         )
     """)
-    # Idempotent migration: add last_seen on DBs created by the old schema.
+    # Idempotent migrations for DBs created by an older schema.
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(speakers)")}
     if "last_seen" not in existing_cols:
         conn.execute("ALTER TABLE speakers ADD COLUMN last_seen TEXT")
+    if "embedder" not in existing_cols:
+        conn.execute("ALTER TABLE speakers ADD COLUMN embedder TEXT NOT NULL DEFAULT 'resemblyzer'")
+    if "dim" not in existing_cols:
+        conn.execute("ALTER TABLE speakers ADD COLUMN dim INTEGER NOT NULL DEFAULT 256")
     conn.commit()
 
 
-def load_enrolled(db_path: Path) -> dict[str, np.ndarray]:
-    """Load all enrolled speakers from SQLite; return name → float32 embedding dict."""
+def load_enrolled(db_path: Path, embedder: str | None = None) -> dict[str, np.ndarray]:
+    """Load enrolled speakers from SQLite; return name → float32 embedding dict.
+
+    When *embedder* is given, only voiceprints stored under that embedder name
+    are returned — a print from a different embedder is a different vector
+    space and must never be cosine-matched against it (fail closed to
+    'unknown', not a garbage score). Pass None to load every print regardless
+    of embedder (e.g. for inspection tooling).
+    """
     if not db_path.exists():
         return {}
     with sqlite3.connect(db_path) as conn:
         _ensure_schema(conn)
-        rows = conn.execute("SELECT name, embedding FROM speakers").fetchall()
+        if embedder is None:
+            rows = conn.execute("SELECT name, embedding FROM speakers").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT name, embedding FROM speakers WHERE embedder = ?", (embedder,)
+            ).fetchall()
     return {name: np.frombuffer(blob, dtype=np.float32) for name, blob in rows}
 
 
@@ -90,19 +120,25 @@ def load_last_seen(db_path: Path, name: str) -> str | None:
     return row[0]  # may be None (NULL) for rows enrolled before this migration
 
 
-def store_speaker(db_path: Path, name: str, embedding: np.ndarray) -> None:
+def store_speaker(
+    db_path: Path, name: str, embedding: np.ndarray, *, embedder: str = "resemblyzer"
+) -> None:
     """Persist a speaker voiceprint (INSERT OR REPLACE on primary key name).
 
     Creates the database file and parent directories if absent. Both the CLI
     ``enroll`` command and the in-conversation voice-enroll path call this so
-    there is exactly one storage code path.
+    there is exactly one storage code path. ``embedder`` names the model that
+    produced *embedding* (its dim is derived from the vector itself) — a
+    future embedder swap means every speaker must re-enroll, since a print
+    from one embedder is never matched under another (see ``load_enrolled``).
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    emb = embedding.astype(np.float32)
     with sqlite3.connect(db_path) as conn:
         _ensure_schema(conn)
         conn.execute(
-            "INSERT OR REPLACE INTO speakers (name, embedding) VALUES (?, ?)",
-            (name, embedding.astype(np.float32).tobytes()),
+            "INSERT OR REPLACE INTO speakers (name, embedding, embedder, dim) VALUES (?, ?, ?, ?)",
+            (name, emb.tobytes(), embedder, int(emb.shape[-1])),
         )
         conn.commit()
 
@@ -116,6 +152,7 @@ class SpeakerIDProcessor(FrameProcessor):
         on_speaker_change: Callable[[str], None] | None = None,
         match_threshold: float = 0.75,
         window_seconds: float = 1.0,
+        embedder_name: str = "resemblyzer",
     ) -> None:
         super().__init__()
         self._db_path = speakers_db_path
@@ -123,8 +160,13 @@ class SpeakerIDProcessor(FrameProcessor):
         self._match_threshold = match_threshold
         self._window_bytes = int(SAMPLE_RATE * 2 * window_seconds)  # 16kHz int16 bytes
 
-        self._enrolled: dict[str, np.ndarray] = load_enrolled(speakers_db_path)
-        self._encoder: VoiceEncoder = VoiceEncoder()  # blocks on torch load — fail fast
+        # Construct the embedder first — its .name selects which voiceprints
+        # are even loadable, so a print from a different embedder is never
+        # cosine-matched (fail closed to 'unknown', not a garbage score).
+        self._encoder: SpeakerEmbedder = get_speaker_embedder(embedder_name)
+        self._enrolled: dict[str, np.ndarray] = load_enrolled(
+            speakers_db_path, embedder=self._encoder.name
+        )
         self._audio_buffer: bytearray = bytearray()
         self._current_speaker: str = "unknown"
         self._identify_task: asyncio.Task | None = None
@@ -146,7 +188,8 @@ class SpeakerIDProcessor(FrameProcessor):
         self._bot_speaking_for_capture: bool = False
 
         logger.info(
-            f"SpeakerIDProcessor ready: {len(self._enrolled)} enrolled speaker(s), "
+            f"SpeakerIDProcessor ready: embedder={self._encoder.name!r}, "
+            f"{len(self._enrolled)} enrolled speaker(s), "
             f"threshold={match_threshold}, window={window_seconds}s"
         )
 
@@ -219,7 +262,7 @@ class SpeakerIDProcessor(FrameProcessor):
     def _identify_speaker(self, pcm_window: bytes) -> None:
         """Embed one window of audio and update _current_speaker."""
         audio = pcm16_to_float32(pcm_window)
-        embedding = np.asarray(self._encoder.embed_utterance(audio))
+        embedding = np.asarray(self._encoder.embed(audio))
 
         if not self._enrolled:
             return
@@ -265,9 +308,9 @@ class SpeakerIDProcessor(FrameProcessor):
         Accumulation only starts after ``bot_stopped_speaking()`` is called —
         so Larry's own "say this back to me" prompt can never pollute the print.
 
-        ``embed_fn`` replaces direct Resemblyzer calls so the state machine is
-        unit-testable without torch. In production, pipeline.py passes a lambda
-        that calls ``self._encoder.embed_utterance``.
+        ``embed_fn`` replaces direct calls into the configured SpeakerEmbedder
+        so the state machine is unit-testable without torch. In production,
+        pipeline.py passes a lambda that calls ``self._encoder.embed``.
         """
         if self._capture_state != "idle":
             logger.info(
@@ -369,10 +412,11 @@ class SpeakerIDProcessor(FrameProcessor):
     async def finalize_capture(self, name: str, audio: np.ndarray) -> dict:
         """Embed and persist a completed capture, off the event loop.
 
-        Runs the Resemblyzer encode in a thread via ``asyncio.to_thread`` so
-        the torch encoder never blocks the pipeline event loop.  Reloads the
-        in-memory enrolled set so the new speaker is immediately identifiable,
-        fires ``_on_speaker_change`` if set, and returns
+        Runs the configured SpeakerEmbedder's encode in a thread via
+        ``asyncio.to_thread`` so the (typically torch-backed) encoder never
+        blocks the pipeline event loop.  Reloads the in-memory enrolled set so
+        the new speaker is immediately identifiable, fires
+        ``_on_speaker_change`` if set, and returns
         ``{"status": "enrolled", "name": name}``.
 
         Must only be called after ``add_capture_audio`` returns "ready".
@@ -385,9 +429,9 @@ class SpeakerIDProcessor(FrameProcessor):
             return {"status": "failed", "name": name, "reason": "embed_fn or db_path missing"}
 
         embedding = np.asarray(await asyncio.to_thread(embed_fn, audio))
-        store_speaker(db_path, name, embedding)
+        store_speaker(db_path, name, embedding, embedder=self._encoder.name)
         # Reload in-memory enrolled set so new speaker is immediately identifiable.
-        self._enrolled = load_enrolled(db_path)
+        self._enrolled = load_enrolled(db_path, embedder=self._encoder.name)
         logger.info(f"Enrolled {name!r} — {len(self._enrolled)} speaker(s) now enrolled")
         if self._on_speaker_change:
             self._on_speaker_change(name)

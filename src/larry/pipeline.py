@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import cast
 
 import httpx
-import numpy as np
 from loguru import logger as _loguru
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -374,6 +373,7 @@ async def run() -> None:
         on_speaker_change=_on_speaker_change,
         match_threshold=cfg.speaker_match_threshold,
         window_seconds=cfg.speaker_window_s,
+        embedder_name=cfg.speaker_embedder,
     )
 
     # ------------------------------------------------------------------
@@ -684,7 +684,7 @@ async def run() -> None:
         def _arm_capture(name: str, **kwargs) -> None:
             speaker_id.arm_capture(
                 name,
-                embed_fn=lambda audio: np.asarray(speaker_id._encoder.embed_utterance(audio)),
+                embed_fn=lambda audio: speaker_id._encoder.embed(audio),
                 db_path=cfg.speakers_db,
                 **kwargs,
             )

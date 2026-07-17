@@ -265,6 +265,26 @@ def test_speaker_id_invalid_raises(monkeypatch, required_keys, env_var, bad_valu
     assert field_name in str(exc.value)
 
 
+def test_speaker_embedder_defaults_to_resemblyzer(monkeypatch, required_keys):
+    monkeypatch.delenv("SPEAKER_EMBEDDER", raising=False)
+    cfg = load_config()
+    assert cfg.speaker_embedder == "resemblyzer"
+
+
+def test_speaker_embedder_override_normalized(monkeypatch, required_keys):
+    monkeypatch.setenv("SPEAKER_EMBEDDER", "  RESEMBLYZER  ")
+    cfg = load_config()
+    assert cfg.speaker_embedder == "resemblyzer"
+
+
+def test_speaker_embedder_rejects_unknown_value(monkeypatch, required_keys):
+    monkeypatch.setenv("SPEAKER_EMBEDDER", "titanet")
+    with pytest.raises(ValueError) as exc:
+        load_config()
+    assert "speaker_embedder" in str(exc.value)
+    assert "titanet" in str(exc.value)
+
+
 def test_self_evolution_defaults(monkeypatch, required_keys):
     cfg = load_config()
     assert cfg.self_layer_path.name == "larry_self.md"

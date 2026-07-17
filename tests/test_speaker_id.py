@@ -1,11 +1,13 @@
 """Unit tests for SpeakerIDProcessor's pure speaker-matching logic.
 
 Self-contained: no heavy ML models, no audio devices, no network. The
-Resemblyzer ``VoiceEncoder`` is monkeypatched with a fake whose embedding
-output is fully controlled, so no torch model ever loads. We exercise
-``_identify_speaker`` directly (synchronous matching logic) rather than the
-async audio-buffering path.
+SpeakerEmbedder is monkeypatched (via ``get_speaker_embedder``) with a fake
+whose embedding output is fully controlled, so no torch model ever loads. We
+exercise ``_identify_speaker`` directly (synchronous matching logic) rather
+than the async audio-buffering path.
 """
+
+import sqlite3
 
 import numpy as np
 import pytest
@@ -14,28 +16,36 @@ import larry.speaker_id as speaker_id
 from larry.speaker_id import SpeakerIDProcessor, load_enrolled, store_speaker
 
 
-class _FakeEncoder:
-    """Stand-in for Resemblyzer's VoiceEncoder.
+class _FakeEmbedder:
+    """Stand-in for a SpeakerEmbedder (e.g. ResemblyzerEmbedder).
 
-    ``embed_utterance`` ignores its audio input and returns a fixed vector set
-    on the instance, letting tests drive the cosine-similarity decision.
+    ``embed`` ignores its audio input and returns a fixed vector set on the
+    instance, letting tests drive the cosine-similarity decision.
     """
 
+    name = "resemblyzer"
     next_embedding: np.ndarray = np.zeros(4, dtype=np.float32)
 
-    def embed_utterance(self, audio: np.ndarray) -> np.ndarray:
+    def embed(self, audio_f32_16k: np.ndarray) -> np.ndarray:
         return self.next_embedding
+
+
+def _patch_embedder(monkeypatch, module=speaker_id) -> _FakeEmbedder:
+    """Monkeypatch ``get_speaker_embedder`` to hand back one fixed fake instance."""
+    fake = _FakeEmbedder()
+    monkeypatch.setattr(module, "get_speaker_embedder", lambda name: fake)
+    return fake
 
 
 @pytest.fixture
 def processor(monkeypatch, tmp_path):
-    """A SpeakerIDProcessor wired to a fake encoder and empty on-disk DB.
+    """A SpeakerIDProcessor wired to a fake embedder and empty on-disk DB.
 
-    ``VoiceEncoder`` is replaced before construction so ``__init__`` never
-    touches torch. The returned processor's ``_enrolled`` dict is populated
-    directly in each test.
+    ``get_speaker_embedder`` is replaced before construction so ``__init__``
+    never touches torch. The returned processor's ``_enrolled`` dict is
+    populated directly in each test.
     """
-    monkeypatch.setattr(speaker_id, "VoiceEncoder", _FakeEncoder)
+    _patch_embedder(monkeypatch)
     proc = SpeakerIDProcessor(speakers_db_path=tmp_path / "speakers.db")
     return proc
 
@@ -87,14 +97,14 @@ def test_no_enrolled_speakers_stays_unknown(processor):
 
 
 def test_speaker_change_callback_fires_with_matched_name(monkeypatch, tmp_path):
-    monkeypatch.setattr(speaker_id, "VoiceEncoder", _FakeEncoder)
+    fake = _patch_embedder(monkeypatch)
     seen: list[str] = []
     proc = SpeakerIDProcessor(
         speakers_db_path=tmp_path / "speakers.db",
         on_speaker_change=seen.append,
     )
     proc._enrolled = {"alice": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)}
-    proc._encoder.next_embedding = np.array([0.97, 0.05, 0.0, 0.0], dtype=np.float32)  # pyright: ignore[reportArgumentType]
+    fake.next_embedding = np.array([0.97, 0.05, 0.0, 0.0], dtype=np.float32)
 
     proc._identify_speaker(b"\x00\x00")
 
@@ -105,7 +115,7 @@ def test_speaker_change_callback_fires_with_matched_name(monkeypatch, tmp_path):
 def test_threshold_boundary_is_inclusive(monkeypatch, tmp_path):
     # Construct an incoming embedding whose cosine vs the stored one is exactly
     # the threshold, to lock the >= (inclusive) comparison.
-    monkeypatch.setattr(speaker_id, "VoiceEncoder", _FakeEncoder)
+    fake = _patch_embedder(monkeypatch)
     proc = SpeakerIDProcessor(
         speakers_db_path=tmp_path / "speakers.db",
         match_threshold=0.75,
@@ -114,7 +124,7 @@ def test_threshold_boundary_is_inclusive(monkeypatch, tmp_path):
     # Unit vector at angle theta where cos(theta) == 0.75.
     incoming = np.array([0.75, np.sqrt(1 - 0.75**2)], dtype=np.float32)
     proc._enrolled = {"alice": stored}
-    proc._encoder.next_embedding = incoming  # pyright: ignore[reportArgumentType]
+    fake.next_embedding = incoming
 
     assert speaker_id.cosine_similarity(incoming, stored) == pytest.approx(0.75)
 
@@ -150,6 +160,86 @@ def test_store_speaker_creates_db_if_missing(tmp_path):
     assert "dan" in load_enrolled(db)
 
 
+# ---------------------------------------------------------------------------
+# Embedder namespacing — a print from one embedder is never matched under
+# another (schema/migration bump, Task 3).
+# ---------------------------------------------------------------------------
+
+
+def test_store_speaker_defaults_embedder_to_resemblyzer(tmp_path):
+    db = tmp_path / "speakers.db"
+    store_speaker(db, "jason", np.array([1.0, 0.0], dtype=np.float32))
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT embedder, dim FROM speakers WHERE name = 'jason'").fetchone()
+    assert row == ("resemblyzer", 2)
+
+
+def test_store_speaker_persists_given_embedder_and_derived_dim(tmp_path):
+    db = tmp_path / "speakers.db"
+    emb = np.zeros(192, dtype=np.float32)
+    store_speaker(db, "jason", emb, embedder="titanet")
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT embedder, dim FROM speakers WHERE name = 'jason'").fetchone()
+    assert row == ("titanet", 192)
+
+
+def test_load_enrolled_filters_by_embedder(tmp_path):
+    db = tmp_path / "speakers.db"
+    store_speaker(db, "alice", np.array([1.0, 0.0], dtype=np.float32), embedder="resemblyzer")
+    store_speaker(db, "bob", np.zeros(192, dtype=np.float32), embedder="titanet")
+
+    resemblyzer_only = load_enrolled(db, embedder="resemblyzer")
+    assert set(resemblyzer_only) == {"alice"}
+
+    titanet_only = load_enrolled(db, embedder="titanet")
+    assert set(titanet_only) == {"bob"}
+
+    everyone = load_enrolled(db)
+    assert set(everyone) == {"alice", "bob"}
+
+
+def test_load_enrolled_legacy_rows_default_to_resemblyzer(tmp_path):
+    """A DB written before the embedder column existed still matches under resemblyzer."""
+    db = tmp_path / "speakers.db"
+    embedding = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    with sqlite3.connect(db) as conn:
+        # Manually create the OLD (pre-Task-3) schema.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS speakers "
+            "(name TEXT PRIMARY KEY, embedding BLOB NOT NULL, "
+            "enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO speakers (name, embedding) VALUES (?, ?)",
+            ("alice", embedding.tobytes()),
+        )
+        conn.commit()
+
+    filtered = load_enrolled(db, embedder="resemblyzer")
+    assert "alice" in filtered
+
+
+def test_speaker_id_never_matches_print_from_different_embedder(monkeypatch, tmp_path):
+    """Migration test: a print labelled for model A is never matched under model B.
+
+    Even a numerically-identical vector must fail closed to 'unknown' — the
+    print belongs to a different embedding space and load_enrolled filters it
+    out before matching ever runs, so this isn't a threshold/near-miss case.
+    """
+    db = tmp_path / "speakers.db"
+    vec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    store_speaker(db, "alice", vec, embedder="titanet")
+
+    fake = _patch_embedder(monkeypatch)  # fake.name == "resemblyzer"
+    proc = SpeakerIDProcessor(speakers_db_path=db)  # default embedder_name="resemblyzer"
+    assert proc._enrolled == {}, "titanet print must not load under a resemblyzer processor"
+
+    fake.next_embedding = vec  # identical vector — would match if not filtered
+    proc._identify_speaker(b"\x00\x00")
+
+    assert proc._current_speaker == "unknown"
+
+
 # Capture state machine tests -----------------------------------------------
 
 _SAMPLE_RATE = 16000
@@ -165,7 +255,7 @@ def _pcm_bytes(seconds: float = 0.1) -> bytes:
 
 def _make_proc(monkeypatch, tmp_path, on_speaker_change=None):
     import larry.speaker_id as sid_mod
-    monkeypatch.setattr(sid_mod, "VoiceEncoder", _FakeEncoder)
+    _patch_embedder(monkeypatch, module=sid_mod)
     return SpeakerIDProcessor(
         speakers_db_path=tmp_path / "speakers.db",
         on_speaker_change=on_speaker_change,
@@ -349,8 +439,6 @@ def test_cap_with_floor_met_returns_ready(monkeypatch, tmp_path):
 # last_seen migration + helpers
 # ---------------------------------------------------------------------------
 
-import sqlite3  # noqa: E402
-
 
 def test_ensure_schema_adds_last_seen_column(tmp_path):
     """_ensure_schema adds last_seen TEXT; calling it twice is idempotent."""
@@ -362,6 +450,35 @@ def test_ensure_schema_adds_last_seen_column(tmp_path):
         assert "last_seen" in cols
         # Second call must not raise.
         speaker_id._ensure_schema(conn)
+
+
+def test_ensure_schema_adds_embedder_and_dim_columns(tmp_path):
+    """_ensure_schema adds embedder TEXT + dim INTEGER; calling it twice is idempotent."""
+    db = tmp_path / "speakers.db"
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(speakers)")}
+        assert {"embedder", "dim"} <= cols
+        speaker_id._ensure_schema(conn)
+
+
+def test_ensure_schema_upgrade_backfills_embedder_and_dim_on_old_rows(tmp_path):
+    """A row written under the pre-Task-3 schema gets embedder/dim defaults, not NULL."""
+    db = tmp_path / "speakers.db"
+    embedding = b"\x00\x00\x80\x3f"  # float32 1.0 as bytes
+    with sqlite3.connect(db) as conn:
+        # Manually create the OLD (pre-embedder-column) schema.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS speakers "
+            "(name TEXT PRIMARY KEY, embedding BLOB NOT NULL, "
+            "enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen TEXT)"
+        )
+        conn.execute("INSERT INTO speakers (name, embedding) VALUES (?, ?)", ("alice", embedding))
+        conn.commit()
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+        row = conn.execute("SELECT embedder, dim FROM speakers WHERE name = 'alice'").fetchone()
+    assert row == ("resemblyzer", 256)
 
 
 def test_ensure_schema_upgrade_preserves_existing_rows(tmp_path):

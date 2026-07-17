@@ -8,6 +8,15 @@ def _default_hardware() -> str:
     return "mock" if sys.platform == "darwin" else "pca9685"
 
 
+def _default_wake_word_custom_path() -> str | None:
+    """Package-relative path to the committed "Hey Larry" model, mirroring
+    personality_path's resolution.  Returns None (falls back to the
+    hey_jarvis pretrained model in wake.py) if the .onnx file isn't present —
+    e.g. a checkout predating training, or one that intentionally omits it."""
+    candidate = Path(__file__).parent / "wake_models" / "hey_larry.onnx"
+    return str(candidate) if candidate.exists() else None
+
+
 @dataclass(frozen=True)
 class Config:
     # API keys
@@ -33,7 +42,10 @@ class Config:
     # Hardware
     larry_hardware: str
     wake_word_model: str  # OpenWakeWord pretrained model name (default: hey_jarvis)
-    wake_word_custom_path: str | None  # path to a custom .onnx model, if any
+    # Path to a custom .onnx model. Defaults to the committed wake_models/hey_larry.onnx
+    # when present; override with WAKE_WORD_CUSTOM_PATH, or unset to fall back to
+    # wake_word_model (hey_jarvis) if the committed model is absent.
+    wake_word_custom_path: str | None
 
     # Turn-taking / VAD tuning (see docs/plan: turn-taking robustness)
     stt_mute_cooldown_s: float  # STT stays muted this long after bot stops speaking
@@ -182,7 +194,8 @@ def load_config() -> Config:
         elevenlabs_model=os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
         larry_hardware=larry_hardware,
         wake_word_model=os.environ.get("WAKE_WORD_MODEL", "hey_jarvis"),
-        wake_word_custom_path=os.environ.get("WAKE_WORD_CUSTOM_PATH"),
+        wake_word_custom_path=os.environ.get("WAKE_WORD_CUSTOM_PATH")
+        or _default_wake_word_custom_path(),
         stt_mute_cooldown_s=float(os.environ.get("STT_MUTE_COOLDOWN_S", "0.2")),
         vad_start_secs=float(os.environ.get("VAD_START_SECS", "0.1")),
         wake_sleep_timeout_s=float(os.environ.get("WAKE_SLEEP_TIMEOUT_S", "20")),

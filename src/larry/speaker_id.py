@@ -663,11 +663,16 @@ class SpeakerTagProcessor(FrameProcessor):
     ``SystemFrame`` processed inline: a second turn's marker can be handled
     before the first turn's queued ``TranscriptionFrame`` is dequeued, so order
     — not recency — is what binds each transcript to its turn. Markers and
-    transcripts stay 1:1 because ``SpeakerIDProcessor`` emits one marker per
-    VAD-stop and the STT (``push_empty_transcripts=True``) emits one transcript
-    per turn; a rare STT *error* (an ``ErrorFrame`` in place of a transcript)
-    drops that turn's marker here, and a ``BotStartedSpeakingFrame`` backstop
-    clears any residual orphan so a 1:1 break can never outlast one turn.
+    transcripts stay 1:1 *by construction*: ``SpeakerIDProcessor`` emits one
+    marker per VAD-stop, and ``SegmentedSTTService`` runs STT once per VAD-stop
+    yielding exactly one frame — a ``TranscriptionFrame`` (empty ones included,
+    via ``push_empty_transcripts=True``) or, on a failed round-trip, a *downstream*
+    ``ErrorFrame`` in place of the transcript. That downstream ErrorFrame drops
+    its turn's marker here. Direction matters: ``push_error()`` sends unrelated
+    LLM/TTS/Mem0 errors *upstream* through this processor, and those must NOT
+    consume a marker — only a downstream STT error does. No BotStarted backstop:
+    the 1:1 invariant needs none, and clearing on BotStarted would drop a marker
+    left legitimately pending by a barge-in and re-introduce the desync.
 
     ``apply_boundary`` (Task 6) is applied to each resolved snapshot to drop the
     prior speaker's turns from the shared context on a continuity break. The tag
@@ -690,25 +695,16 @@ class SpeakerTagProcessor(FrameProcessor):
                 self._pending.append(frame.snapshot)
             return
         if isinstance(frame, ErrorFrame):
-            # A raw STT error yields an ErrorFrame in place of this turn's
-            # transcript (push_empty_transcripts only covers an *empty* result,
-            # not a failed round-trip). The marker just enqueued for that turn
-            # would otherwise be popped by the NEXT turn's transcript and shift
-            # attribution, so discard it. ErrorFrame arrives after the failed
-            # round-trip that separates it from any prior turn's already-tagged
-            # transcript, so the front entry is this errored turn's.
-            if self._pending:
+            # A failed STT round-trip yields a *downstream* ErrorFrame in place of
+            # this turn's transcript (push_empty_transcripts only covers an *empty*
+            # result). That downstream error is this turn's one STT frame, so drop
+            # its marker — else the NEXT turn's transcript pops it and shifts
+            # attribution. But push_error() sends unrelated LLM/TTS/Mem0 errors
+            # UPSTREAM through here; those are not STT turn errors and must leave
+            # `_pending` untouched, or a downstream failure would silently
+            # mis-attribute a live upstream turn. Gate strictly on direction.
+            if direction == FrameDirection.DOWNSTREAM and self._pending:
                 self._pending.popleft()
-            await self.push_frame(frame, direction)
-            return
-        if isinstance(frame, BotStartedSpeakingFrame):
-            # Backstop: by the time Larry begins speaking, the user turn that
-            # prompted him is fully transcribed and its marker consumed, so
-            # `_pending` is normally empty here. Any residual entry is a stranded
-            # orphan (a rare 1:1 break the handlers above didn't catch); dropping
-            # it bounds the damage to a single turn rather than the rest of the
-            # session. Fires on the upstream-travelling frame; forward unchanged.
-            self._pending.clear()
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, TranscriptionFrame):

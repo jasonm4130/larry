@@ -12,9 +12,12 @@ the VAD boundary, consumed by the downstream ``SpeakerTagProcessor``):
   * the tagger's pending FIFO binding each transcript to its *own* turn's
     identification, not a live ``current_speaker`` a later turn flipped
     (Codex P2), and surviving two turns closing before either transcript,
-  * a fully-muted bot-echo turn (VAD-stop with no transcript) emitting NO
-    marker, so it can never desync attribution for later turns — the Critical
-    the in-band redesign closes,
+  * a fully-muted bot-echo turn emitting one marker per VAD-stop like any turn,
+    paired 1:1 with the empty transcript ``push_empty_transcripts`` yields, so it
+    can never desync attribution for later turns — the Critical the in-band
+    redesign closes,
+  * error/BotStarted frames travelling UPSTREAM never consuming a live marker
+    (only a downstream STT error, in place of a transcript, does),
   * an unconfirmed new-speaker turn snapshotting ``unknown`` (never inherited).
 
 Self-contained: the SpeakerEmbedder is monkeypatched so no torch model loads.
@@ -204,26 +207,52 @@ def test_error_frame_drops_orphan_marker():
     _run(body)
 
 
-def test_bot_started_clears_stranded_orphan():
-    """Backstop: a stranded marker (a 1:1 break the ErrorFrame handler didn't
-    catch) is cleared when Larry next starts speaking, so it can't desync later
-    turns. Without the backstop, bob's turn would pop the stranded alice marker."""
+def test_upstream_error_does_not_drop_pending_marker():
+    """`push_error()` sends LLM/TTS/mem0 errors UPSTREAM through the tagger. An
+    upstream ErrorFrame is unrelated to STT turn-marking (STT errors arrive
+    DOWNSTREAM, in place of a transcript), so it must NOT consume a pending
+    marker. Bob's marker is pending when an unrelated downstream-service error
+    passes upstream; his transcript must still tag bob, not shift to unknown."""
 
     async def body():
         tagger = SpeakerTagProcessor(_passthrough, enable_direct_mode=True)
         sink = _Sink()
         await _link(tagger, sink)
 
-        # An orphan marker with no transcript and no error to clear it.
-        await tagger.process_frame(_identity("alice"), FrameDirection.DOWNSTREAM)
-        # Larry begins speaking -> the backstop clears the stranded orphan.
-        await tagger.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-        # Bob's turn is now tagged with its own identity.
         await tagger.process_frame(_identity("bob"), FrameDirection.DOWNSTREAM)
-        await tagger.process_frame(_transcription("bob now"), FrameDirection.DOWNSTREAM)
+        # An unrelated LLM/TTS error travels upstream through the tagger.
+        await tagger.process_frame(ErrorFrame(error="llm 500"), FrameDirection.UPSTREAM)
+        await tagger.process_frame(_transcription("still bob"), FrameDirection.DOWNSTREAM)
         await asyncio.sleep(0)
 
-        assert _transcriptions(sink) == ["[speaker: bob] bob now"]
+        assert _transcriptions(sink) == ["[speaker: bob] still bob"]
+
+    _run(body)
+
+
+def test_bot_started_does_not_disturb_pending_marker():
+    """A `BotStartedSpeakingFrame` travels UPSTREAM through the tagger (so
+    STTMute upstream hears it). It must NOT clear a marker legitimately pending
+    for a turn whose transcript is still in flight: bob speaks and his marker is
+    enqueued, Larry starts replying to an earlier turn, then bob's transcript
+    arrives — it must still tag bob. Because markers and STT frames are 1:1 by
+    construction (one marker per VAD-stop, exactly one STT frame per VAD-stop),
+    no clear-on-BotStarted backstop is needed; one that fired here would clear a
+    live marker on barge-in and RE-introduce the very desync this branch closes."""
+
+    async def body():
+        tagger = SpeakerTagProcessor(_passthrough, enable_direct_mode=True)
+        sink = _Sink()
+        await _link(tagger, sink)
+
+        await tagger.process_frame(_identity("bob"), FrameDirection.DOWNSTREAM)
+        # Larry starts replying to an earlier turn; the frame travels upstream.
+        await tagger.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+        # Bob's transcript finally arrives — still bound to his own marker.
+        await tagger.process_frame(_transcription("bob barged in"), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0)
+
+        assert _transcriptions(sink) == ["[speaker: bob] bob barged in"]
 
     _run(body)
 

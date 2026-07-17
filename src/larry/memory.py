@@ -141,11 +141,18 @@ class ScopedMem0MemoryService(Mem0MemoryService):
         except Exception as e:
             logger.error(f"Error storing messages in Mem0: {e}")
 
+    # Last (user_id, query) actually retrieved. The dedup key MUST include the
+    # speaker: keyed on the query alone, a second speaker asking the identical
+    # thing right after the first would be silently skipped and get no memories
+    # (Codex P2). Class-level default so the __new__-built instances in tests and
+    # the base-__init__ production path both start clean without an override.
+    _last_scoped: tuple[str, str] | None = None
+
     async def _enhance_scoped(self, context: LLMContext, query: str, user_id: str) -> None:
         """Insert the *user_id*-scoped memories into the context before the LLM."""
-        if self.last_query == query:
+        if self._last_scoped == (user_id, query):
             return
-        self.last_query = query
+        self._last_scoped = (user_id, query)
 
         memories = await self._retrieve_scoped(query, user_id)
         results = memories.get("results", []) if isinstance(memories, dict) else memories

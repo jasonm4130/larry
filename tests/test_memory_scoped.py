@@ -215,3 +215,39 @@ def test_scope_context_frame_scopes_known_speaker():
     # Retrieval + store both scoped to bob, on bob's own current text only.
     assert enhanced == [("current words", "bob")]
     assert scheduled == ["mem0_store"]
+
+
+# --------------------------------------------------------------------------
+# _enhance_scoped dedup must be scoped per-speaker (Codex P2): the same-query
+# short-circuit exists to skip a repeat *within one speaker*, not to drop a
+# different speaker's identical question.
+# --------------------------------------------------------------------------
+
+
+def test_enhance_dedup_is_scoped_per_speaker():
+    async def body():
+        svc, fake = _make_service()
+        ctx_a = LLMContext(messages=[{"role": "system", "content": "sys"}])
+        ctx_b = LLMContext(messages=[{"role": "system", "content": "sys"}])
+
+        await svc._enhance_scoped(ctx_a, "what time is it", "alice")
+        await svc._enhance_scoped(ctx_b, "what time is it", "bob")
+
+        # Bob's identical query must NOT be swallowed by alice's dedup slot.
+        assert [c["user_id"] for c in fake.search_calls] == ["alice", "bob"]
+
+    asyncio.run(body())
+
+
+def test_enhance_dedup_still_skips_same_speaker_repeat():
+    async def body():
+        svc, fake = _make_service()
+        ctx = LLMContext(messages=[{"role": "system", "content": "sys"}])
+
+        await svc._enhance_scoped(ctx, "what time is it", "alice")
+        await svc._enhance_scoped(ctx, "what time is it", "alice")
+
+        # Same speaker, same query, back-to-back: still one retrieval.
+        assert len(fake.search_calls) == 1
+
+    asyncio.run(body())

@@ -26,7 +26,7 @@ from pipecat.turns.user_start import (
     TranscriptionUserTurnStartStrategy,
     VADUserTurnStartStrategy,
 )
-from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_stop import BaseUserTurnStopStrategy, SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from larry.turn_taking import make_user_aggregator_params, make_user_turn_strategies
@@ -74,6 +74,6 @@ def test_user_turn_strategies_start_is_vad_only():
 
 
 def test_user_turn_strategies_passes_stop_through_unchanged():
-    stop = [SpeechTimeoutUserTurnStopStrategy()]
+    stop: list[BaseUserTurnStopStrategy] = [SpeechTimeoutUserTurnStopStrategy()]
     strategies = make_user_turn_strategies(stop=stop)
     assert strategies.stop == stop

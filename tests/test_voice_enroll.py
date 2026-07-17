@@ -73,7 +73,7 @@ def test_enroll_handler_arms_capture_and_speaks_repeat_prompt():
         # relayed through the LLM — and it carries the chosen phrase.
         assert spoken == [ve.enrollment_instruction(expected_phrase)]
         assert spoken[0].lower().startswith("repeat the phrase")
-        assert params._result["status"] == "enrolling"
+        assert params._result is not None and params._result["status"] == "enrolling"
         # The LLM's own spoken turn is suppressed so there is no double-talk.
         assert params._properties is not None and params._properties.run_llm is False
 
@@ -114,7 +114,7 @@ def test_enroll_handler_ignores_empty_name():
         await handler(params)
         assert armed == []
         assert spoken == []  # nothing spoken on a bad name
-        assert params._result["status"] == "error"
+        assert params._result is not None and params._result["status"] == "error"
         assert params._properties is not None and params._properties.run_llm is False
 
     asyncio.run(body())

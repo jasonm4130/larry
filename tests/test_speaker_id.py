@@ -28,7 +28,10 @@ class _FakeEmbedder:
     name = "resemblyzer"
     next_embedding: np.ndarray = np.zeros(4, dtype=np.float32)
 
-    def embed(self, audio_f32_16k: np.ndarray) -> np.ndarray:
+    def embed(self, audio_f32_16k: np.ndarray, /) -> np.ndarray:
+        # Positional-only: tests reassign `fake.embed` to helper fns whose param
+        # is named differently (e.g. `audio`); the embedder is always called
+        # positionally, so pyright shouldn't require a matching keyword name.
         return self.next_embedding
 
 

@@ -58,6 +58,7 @@ def enrollment_instruction(phrase: str) -> str:
 # Tool schema factory
 # ---------------------------------------------------------------------------
 
+
 def build_voice_tools() -> ToolsSchema:
     """Build ToolsSchema for both voice tools (enroll_speaker + dismiss)."""
     enroll_fn = FunctionSchema(
@@ -92,6 +93,7 @@ def build_voice_tools() -> ToolsSchema:
 # ---------------------------------------------------------------------------
 # Handler factories
 # ---------------------------------------------------------------------------
+
 
 def make_enroll_speaker_handler(
     *,

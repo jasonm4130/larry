@@ -66,7 +66,9 @@ def test_compose_puts_guardrails_last_even_with_adversarial_self_layer():
 
 def test_compose_omits_self_section_when_empty():
     prompt = self_layer.compose_system_prompt(
-        card=_CARD, self_block="", time_context="It is morning.",
+        card=_CARD,
+        self_block="",
+        time_context="It is morning.",
         guardrails=self_layer.extract_hard_constraints(_CARD),
     )
     assert self_layer.SELF_HEADER not in prompt

@@ -365,9 +365,7 @@ async def run() -> None:
         last_seen = speaker_id_module.load_last_seen(cfg.speakers_db, new_name)
         phrase = awareness.recency_phrase(last_seen, datetime.datetime.now(datetime.UTC))
         if phrase is not None:
-            _recency_line["value"] = (
-                f"You are speaking with {new_name}. Last with you {phrase}."
-            )
+            _recency_line["value"] = f"You are speaking with {new_name}. Last with you {phrase}."
         else:
             # First time this speaker has talked to Larry.
             _recency_line["value"] = f"You are speaking with {new_name} for the first time."
@@ -379,9 +377,7 @@ async def run() -> None:
         # so call_soon_threadsafe is belt-and-braces — it schedules the refresh
         # onto the main loop and stays correct even if a future caller fires this
         # from another thread.
-        _main_loop.call_soon_threadsafe(
-            lambda: _main_loop.create_task(_refresh_system_prompt())
-        )
+        _main_loop.call_soon_threadsafe(lambda: _main_loop.create_task(_refresh_system_prompt()))
 
     speaker_id = SpeakerIDProcessor(
         speakers_db_path=cfg.speakers_db,
@@ -488,6 +484,7 @@ async def run() -> None:
         _custom_tool_fns.extend(getattr(_schema, "custom_tools", None) or [])
     if _tool_fns or _custom_tool_fns:
         from pipecat.adapters.schemas.tools_schema import ToolsSchema
+
         _tools_kwargs: dict = {"standard_tools": _tool_fns}
         if _custom_tool_fns:
             _tools_kwargs["custom_tools"] = _custom_tool_fns

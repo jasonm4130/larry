@@ -174,9 +174,7 @@ def load_last_seen(db_path: Path, name: str) -> str | None:
         return None
     with sqlite3.connect(db_path) as conn:
         _ensure_schema(conn)
-        row = conn.execute(
-            "SELECT last_seen FROM speakers WHERE name = ?", (name,)
-        ).fetchone()
+        row = conn.execute("SELECT last_seen FROM speakers WHERE name = ?", (name,)).fetchone()
     if row is None:
         return None
     return row[0]  # may be None (NULL) for rows enrolled before this migration
@@ -278,7 +276,7 @@ class SpeakerIDProcessor(FrameProcessor):
 
         # Capture state machine — arms on enroll_speaker tool call, accumulates
         # voiced audio post-BotStoppedSpeakingFrame, embeds on threshold.
-        self._capture_state: str = "idle"   # "idle" | "armed" | "capturing"
+        self._capture_state: str = "idle"  # "idle" | "armed" | "capturing"
         self._capture_name: str = ""
         self._capture_bytes: bytearray = bytearray()
         self._capture_voiced_bytes: int = 0

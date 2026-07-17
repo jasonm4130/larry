@@ -135,9 +135,7 @@ def build_self_tool() -> ToolsSchema:
     return ToolsSchema(standard_tools=[fn])
 
 
-def make_keep_about_self_handler(
-    path: Path, on_updated: Callable[[], Awaitable[None]]
-):
+def make_keep_about_self_handler(path: Path, on_updated: Callable[[], Awaitable[None]]):
     """Build an async Pipecat function handler bound to ``path``.
 
     ``on_updated`` is awaited after each append so the caller can rebuild the

@@ -93,7 +93,7 @@ def test_enroll_handler_normalises_name():
             arm_capture_fn=lambda name, **_k: armed_names.append(name), speak_fn=fake_speak
         )
         await handler(params)
-        assert armed_names[0] == "alice"   # normalised
+        assert armed_names[0] == "alice"  # normalised
 
     asyncio.run(body())
 

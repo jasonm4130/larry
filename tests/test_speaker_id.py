@@ -246,7 +246,7 @@ def test_late_embed_attributes_to_its_own_turn(monkeypatch, tmp_path):
     )
     proc._enrolled = {"alice": alice, "bob": bob}
 
-    a_bytes = np.array([10000, 0, 0], dtype=np.int16).tobytes()   # → alice
+    a_bytes = np.array([10000, 0, 0], dtype=np.int16).tobytes()  # → alice
     b_bytes = np.array([-10000, 0, 0], dtype=np.int16).tobytes()  # → bob
 
     async def run():
@@ -420,6 +420,7 @@ def _pcm_bytes(seconds: float = 0.1) -> bytes:
 
 def _make_proc(monkeypatch, tmp_path, on_speaker_change=None):
     import larry.speaker_id as sid_mod
+
     _patch_embedder(monkeypatch, module=sid_mod)
     return SpeakerIDProcessor(
         speakers_db_path=tmp_path / "speakers.db",
@@ -439,7 +440,7 @@ def test_arm_capture_ignored_when_already_armed(monkeypatch, tmp_path):
     proc = _make_proc(monkeypatch, tmp_path)
     emb = np.array([0.9, 0.1], dtype=np.float32)
     proc.arm_capture("jason", embed_fn=lambda audio: emb)
-    proc.arm_capture("dan", embed_fn=lambda audio: emb)   # second call ignored
+    proc.arm_capture("dan", embed_fn=lambda audio: emb)  # second call ignored
     assert proc._capture_name == "jason"
 
 
@@ -486,6 +487,7 @@ def test_unvoiced_audio_not_accumulated(monkeypatch, tmp_path):
 def test_successful_capture_returns_ready_and_finalize_stores(monkeypatch, tmp_path):
     """add_capture_audio returns 'ready'; finalize_capture stores and fires callback."""
     import asyncio
+
     db = tmp_path / "speakers.db"
     fixed_emb = np.array([0.7, 0.3], dtype=np.float32)
     completed: list[str] = []
@@ -521,7 +523,7 @@ def test_successful_capture_returns_ready_and_finalize_stores(monkeypatch, tmp_p
     assert final["status"] == "enrolled"
     assert final["name"] == "jason"
     assert "jason" in load_enrolled(db)
-    assert completed == ["jason"]   # on_speaker_change fired
+    assert completed == ["jason"]  # on_speaker_change fired
     assert proc._capture_state == "idle"
 
 
@@ -532,6 +534,7 @@ def test_abort_when_wall_clock_cap_expires_with_insufficient_voiced(monkeypatch,
     proc = _make_proc(monkeypatch, tmp_path)
     # Patch time.monotonic inside speaker_id so the cap is controllable.
     import larry.speaker_id as sid_mod
+
     fake_time = [0.0]
     monkeypatch.setattr(sid_mod, "_monotonic", lambda: fake_time[0])
 
@@ -546,24 +549,26 @@ def test_abort_when_wall_clock_cap_expires_with_insufficient_voiced(monkeypatch,
     proc.bot_stopped_speaking()
 
     # Advance fake time past cap; add only 2s voiced (< 6s floor).
-    fake_time[0] = 6.0   # past the 5s cap
+    fake_time[0] = 6.0  # past the 5s cap
     result = proc.add_capture_audio(_pcm_bytes(2.0), vad_voiced=True, bot_speaking=False)
 
     assert result is not None
     assert result["status"] == "abort"
-    assert "jason" not in load_enrolled(db)   # nothing written
+    assert "jason" not in load_enrolled(db)  # nothing written
     assert proc._capture_state == "idle"
 
 
 def test_cap_with_floor_met_returns_ready(monkeypatch, tmp_path):
     """FIX B: when cap expires but voiced >= floor, return 'ready' (not stuck)."""
     import asyncio
+
     db = tmp_path / "speakers.db"
     fixed_emb = np.array([0.7, 0.3], dtype=np.float32)
     completed: list[str] = []
 
     proc = _make_proc(monkeypatch, tmp_path, on_speaker_change=completed.append)
     import larry.speaker_id as sid_mod
+
     fake_time = [0.0]
     monkeypatch.setattr(sid_mod, "_monotonic", lambda: fake_time[0])
 

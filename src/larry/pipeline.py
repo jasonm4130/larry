@@ -4,8 +4,9 @@ Pipeline order:
     transport.input()
       → WakeWordGate           # gates everything until "Hey Larry" (or "hey_jarvis" fallback)
       → VADProcessor           # emits VADUser{Started,Stopped}SpeakingFrame for STT segmentation
-      → SpeakerIDProcessor     # tags TranscriptionFrames with [speaker: name]
+      → SpeakerIDProcessor     # identifies the turn's speaker (audio → identity)
       → GroqSTT
+      → SpeakerTagProcessor    # tags each transcript with the turn's frozen [speaker: name]
       → user_agg               # idle detection wired here via user_idle_timeout
       → Mem0MemoryService      # injects per-person facts before the LLM
       → OpenAILLM (via OpenRouter)
@@ -67,7 +68,8 @@ from larry.hardware import get_jaw_driver
 from larry.jaw import JawAmplitudeMapper
 from larry.memory import ConversationLog, make_memory_service
 from larry.processors import STTMuteOnBotSpeech, WhisperHallucinationFilter
-from larry.speaker_id import SpeakerIDProcessor
+from larry.speaker_id import SpeakerIDProcessor, SpeakerTagProcessor
+from larry.speaker_tag import parse_speaker_tag
 from larry.stt_mute_fix import MutedGroqSTTService
 from larry.turn_taking import make_user_aggregator_params, make_user_turn_strategies
 from larry.wake import make_wake_word_gate
@@ -320,11 +322,22 @@ async def run() -> None:
         vad_analyzer=SileroVADAnalyzer(params=vad_params),
     )
 
+    # Per-speaker identity attribution requires SEGMENTED STT (one transcript
+    # per VAD turn), so a snapshot taken at the VAD boundary correlates to the
+    # transcript that follows.  xAI direct STT is streaming — it emits
+    # TranscriptionFrames asynchronously with no VAD-turn identifier and can
+    # emit one speaker's transcript after another's boundary is recorded — so
+    # the identity path (snapshot tag + scoped Mem0 binding) is formally scoped
+    # out there; a loud warning fires below and Mem0 falls back to its base
+    # single-namespace behaviour.
+    _use_xai_stt = cfg.stt_provider == "xai" and bool(cfg.xai_api_key)
+
     # ------------------------------------------------------------------
-    # Phase 3: memory service (user_id starts as "unknown"; updated on
-    # speaker change once SpeakerIDProcessor identifies someone)
+    # Phase 3: memory service (user_id starts as "unknown"; the scoped service
+    # binds each turn to the frozen [speaker: …] snapshot on the segmented path;
+    # the streaming xAI path uses the base single-namespace service)
     # ------------------------------------------------------------------
-    mem0_service = make_memory_service(cfg, user_id="unknown")
+    mem0_service = make_memory_service(cfg, user_id="unknown", scoped=not _use_xai_stt)
 
     # ------------------------------------------------------------------
     # Phase 3: conversation log
@@ -391,8 +404,14 @@ async def run() -> None:
     # MutedGroqSTTService (Groq's SegmentedSTTService ignores `_muted`) + the
     # WhisperHallucinationFilter (verbose_json per-segment drops + static
     # denylist) to mute correctly and mitigate hallucinations at the source.
-    if cfg.stt_provider == "xai" and cfg.xai_api_key:
-        logger.info("STT: xAI direct (streaming)")
+    if _use_xai_stt:
+        logger.warning(
+            "STT: xAI direct (streaming) — per-speaker identity attribution is DISABLED. "
+            "The [speaker: …] tag, scoped Mem0 binding, and per-turn snapshot require "
+            "segmented STT (STT_PROVIDER=groq); on this streaming path transcripts carry no "
+            "VAD-turn identifier, so Mem0 falls back to a single namespace and may mix speakers."
+        )
+        assert cfg.xai_api_key is not None  # guaranteed by _use_xai_stt; narrows for the checker
         stt = XAISTTService(api_key=cfg.xai_api_key)
     else:
         logger.info("STT: Groq Whisper-large-v3-turbo (segmented)")
@@ -532,6 +551,17 @@ async def run() -> None:
     # downstream audio processors).  The aggregator consumes LLMTextFrames
     # to build the assistant turn for context; if placed before TTS it
     # swallows them and TTS gets nothing to speak.
+    # SpeakerTagProcessor tags each STT transcript with THIS turn's frozen
+    # snapshot (via speaker_id.take_turn_snapshot).  It must sit AFTER stt (so it
+    # sees the TranscriptionFrame STT emits downstream — the upstream tagger of
+    # finding #2 never did) and BEFORE WhisperHallucinationFilter (whose
+    # ^[speaker:…] strip is non-mutating), so the tag rides frame.text all the
+    # way into the LLM context.  Segmented STT only; skipped on the xAI path.
+    post_stt: list = [stt]
+    if not _use_xai_stt:
+        post_stt.append(SpeakerTagProcessor(speaker_id.take_turn_snapshot))
+    post_stt.append(WhisperHallucinationFilter())
+
     pipeline = Pipeline(
         [
             transport.input(),
@@ -539,8 +569,7 @@ async def run() -> None:
             vad_processor,
             STTMuteOnBotSpeech(cool_down_s=cfg.stt_mute_cooldown_s),
             speaker_id,
-            stt,
-            WhisperHallucinationFilter(),
+            *post_stt,
             user_agg,
             mem0_service,
             llm,
@@ -743,7 +772,12 @@ async def run() -> None:
 
     @user_agg.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(aggregator, *args, **kwargs) -> None:  # noqa: ARG001
-        # Grab the last user message from context to capture what was said.
+        # Bind the log to the turn's OWN frozen [speaker: …] snapshot (parsed off
+        # the tagged user message), not speaker_id.current_speaker read live — a
+        # later turn's identify can flip current_speaker before this fires (the
+        # same Codex-P2 race the tag fixes).  Fall back to the live value only on
+        # the untagged (streaming xAI) path, which has no per-turn snapshot.
+        _pending["speaker"] = speaker_id.current_speaker
         messages = context.get_messages()
         for msg in reversed(messages):
             # context.get_messages() returns a mix of dict-style standard
@@ -753,9 +787,11 @@ async def run() -> None:
                 continue
             content = msg.get("content")
             if msg.get("role") == "user" and isinstance(content, str):
-                _pending["user_text"] = content
+                name, clean = parse_speaker_tag(content)
+                _pending["user_text"] = clean  # store the words, not the tag
+                if name is not None:
+                    _pending["speaker"] = name
                 break
-        _pending["speaker"] = speaker_id.current_speaker
         await _refresh_system_prompt()  # keep time register live every turn
 
     @assistant_agg.event_handler("on_assistant_turn_stopped")

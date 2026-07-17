@@ -6,7 +6,7 @@ via SPEAKER_EMBEDDER — this module never calls a specific model's SDK.
 
 import asyncio
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from time import monotonic as _monotonic
 
@@ -25,7 +25,15 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from larry.speaker_embedder import SpeakerEmbedder, get_speaker_embedder
+from larry.speaker_tag import format_speaker_tag
 from larry.voice_enroll import SAMPLE_RATE
+
+# Upper bound on how long the SpeakerTagProcessor waits for a turn's own embed
+# to resolve before failing closed to 'unknown'. The turn-scoped embed almost
+# always finishes before the STT network round-trip returns, so this is a
+# safety ceiling, not the expected wait. ponytail: fixed 3s ceiling; if real
+# embeds ever approach it, tie it to the encoder latency budget instead.
+_SNAPSHOT_AWAIT_TIMEOUT_S = 3.0
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -180,7 +188,11 @@ class SpeakerIDProcessor(FrameProcessor):
         # embedding is inherently tied to its own turn — no rolling window that
         # straddles turns, no post-hoc result landing on the wrong turn.
         self._turn_audio: bytearray = bytearray()
-        self._turn_identify_task: asyncio.Task | None = None
+        # Holds THIS turn's identity result (a Task from the embed, or a resolved
+        # Future for turns we don't identify).  take_turn_snapshot awaits it so
+        # the downstream tagger reads the turn's own frozen identity, not a live
+        # current_speaker that a later turn may already have flipped.
+        self._turn_identify_task: asyncio.Future[str] | None = None
 
         # _current_speaker is the *confirmed* speaker: it switches only after
         # hysteresis commits a new one, never on a single stray turn.
@@ -222,6 +234,32 @@ class SpeakerIDProcessor(FrameProcessor):
     @property
     def current_speaker(self) -> str:
         return self._current_speaker
+
+    async def take_turn_snapshot(self) -> str:
+        """Return the frozen identity of the most recently ended turn.
+
+        The downstream SpeakerTagProcessor calls this when a TranscriptionFrame
+        arrives, so the tag binds to *that* turn's own identification (awaited,
+        bounded) — never a live ``current_speaker`` read, which a later turn's
+        identify could already have flipped to a different speaker (Codex P2).
+
+        Fails closed to ``'unknown'`` if there is no turn task yet, if the embed
+        overruns ``_SNAPSHOT_AWAIT_TIMEOUT_S``, or if it errored — an unattributed
+        turn is safe (Larry has a new-voice register); a wrong name is not. The
+        embed is ``shield``ed so a wait-timeout here never cancels it: it keeps
+        running to update the hysteresis streak for subsequent turns.
+        """
+        task = self._turn_identify_task
+        if task is None:
+            return "unknown"
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), _SNAPSHOT_AWAIT_TIMEOUT_S)
+        except (TimeoutError, asyncio.CancelledError):
+            logger.warning("Turn snapshot timed out waiting on embed — failing closed to unknown")
+            return "unknown"
+        except Exception:
+            logger.warning("Turn snapshot embed failed — failing closed to unknown", exc_info=True)
+            return "unknown"
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -276,16 +314,22 @@ class SpeakerIDProcessor(FrameProcessor):
             # busy with the enroll embed, and identifying the enrollment phrase is
             # pointless.  (_encoder_lock would serialize them safely anyway — this
             # just avoids the wasted embed and keeps enrollment turns out of the
-            # hysteresis streak.)
+            # hysteresis streak.)  Either way, set _turn_identify_task to THIS
+            # turn's result so take_turn_snapshot never hands the downstream
+            # tagger a stale prior turn's identity: an enrollment turn resolves
+            # to 'unknown' rather than inheriting the last confirmed speaker.
             if self._capture_state == "idle":
                 self._turn_identify_task = asyncio.create_task(self._identify_turn(turn_bytes))
-            await self.push_frame(frame, direction)
-
-        elif isinstance(frame, TranscriptionFrame):
-            frame.text = f"[speaker: {self._current_speaker}] {frame.text}"
+            else:
+                unknown: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                unknown.set_result("unknown")
+                self._turn_identify_task = unknown
             await self.push_frame(frame, direction)
 
         else:
+            # SpeakerIDProcessor is single-responsibility (audio → identity): it
+            # sits upstream of STT and never sees TranscriptionFrames, so tagging
+            # lives in the downstream SpeakerTagProcessor, not here.
             await self.push_frame(frame, direction)
 
     async def _identify_turn(self, pcm_bytes: bytes) -> str:
@@ -532,3 +576,32 @@ class SpeakerIDProcessor(FrameProcessor):
             self._on_speaker_change(name)
         self._capture_state = "idle"
         return {"status": "enrolled", "name": name}
+
+
+class SpeakerTagProcessor(FrameProcessor):
+    """Prefix each STT transcript with its turn's frozen ``[speaker: …]`` tag.
+
+    Placed *after* STT (and before ``WhisperHallucinationFilter``) — unlike
+    ``SpeakerIDProcessor``, which sits upstream of STT and so never sees the
+    ``TranscriptionFrame`` STT emits (finding #2: that is exactly why the old
+    upstream tag never reached the LLM).
+
+    The snapshot comes from ``snapshot_provider`` (in production,
+    ``SpeakerIDProcessor.take_turn_snapshot``), which awaits *this* turn's own
+    identification — not a live ``current_speaker`` read that a later turn's
+    identify could have already flipped to a different speaker. The tag then
+    rides ``frame.text`` unchanged through the (non-mutating) hallucination
+    filter into the LLM context, so the LLM, Mem0, and the conversation log all
+    see the same identity that was frozen at the turn boundary.
+    """
+
+    def __init__(self, snapshot_provider: Callable[[], Awaitable[str]], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._snapshot_provider = snapshot_provider
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            snapshot = await self._snapshot_provider()
+            frame.text = format_speaker_tag(snapshot, frame.text)
+        await self.push_frame(frame, direction)

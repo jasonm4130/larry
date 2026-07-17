@@ -11,17 +11,162 @@ Fact-extraction LLM: anthropic/claude-haiku-4-5 via OpenRouter.
 Vector store: Qdrant with a local path under cfg.mem0_dir (no server needed).
 """
 
+import asyncio
 import contextlib
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from loguru import logger
+from pipecat.frames.frames import Frame, LLMContextFrame
+from pipecat.processors.aggregators.llm_context import LLMContext, LLMContextMessage
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.mem0.memory import Mem0MemoryService
 
 from larry.config import Config
+from larry.speaker_tag import parse_speaker_tag
 
 
-def make_memory_service(cfg: Config, *, user_id: str = "unknown") -> Mem0MemoryService:
+def scoped_turn(context_messages: list[Any]) -> tuple[str, str] | None:
+    """Resolve the current turn's ``(speaker, clean_user_text)`` from context.
+
+    Reads the *latest* user message and parses the ``[speaker: …]`` tag frozen
+    onto it at the turn boundary (by ``SpeakerTagProcessor``). Returns ``None``
+    when the context has no string user message. ``speaker`` is ``'unknown'``
+    when the message carries no tag (the streaming-STT path) or an explicit
+    ``[speaker: unknown]`` — callers must skip all Mem0 I/O for it so every
+    unidentified voice does not pile into one shared 'unknown' namespace.
+    """
+    for message in reversed(context_messages):
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+        ):
+            name, text = parse_speaker_tag(message["content"])
+            return (name or "unknown", text)
+    return None
+
+
+class ScopedMem0MemoryService(Mem0MemoryService):
+    """Mem0 service that binds each turn to its *frozen* speaker snapshot.
+
+    Fixes two Codex-P1 races in the base ``Mem0MemoryService`` for a
+    multi-speaker deployment:
+
+    1. **Deferred-store user_id race.** The base fires ``_store_messages`` as a
+       background task that reads ``self.user_id`` *when it runs*; a speaker
+       change between queueing and running binds the store to the wrong person.
+       Here the snapshot is parsed from the turn's ``[speaker: …]`` tag at
+       *queue* time and passed explicitly into the store.
+    2. **Whole-context payload.** The base builds the store payload from *every*
+       user/assistant message in the shared context, so one person's prior turns
+       get stored under the next speaker. Here the payload is only the current
+       turn's own user message.
+
+    Retrieval uses the same frozen snapshot, and an ``unknown`` turn does no
+    Mem0 I/O at all. Assumes a local ``mem0.Memory`` client (what
+    ``make_memory_service`` always constructs).
+    """
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Scope memory I/O to the turn's frozen snapshot.
+
+        Deliberately bypasses ``Mem0MemoryService.process_frame`` (its store is
+        the racy, whole-context one) and runs only the ``FrameProcessor`` base
+        bookkeeping, then reimplements the context-frame handling.
+        """
+        await FrameProcessor.process_frame(self, frame, direction)
+
+        if not isinstance(frame, LLMContextFrame):
+            await self.push_frame(frame, direction)
+            return
+
+        try:
+            await self._scope_context_frame(frame.context)
+            await self.push_frame(frame)
+        except Exception as e:
+            await self.push_error(error_msg=f"Error processing with scoped Mem0: {e}", exception=e)
+            await self.push_frame(frame)
+
+    async def _scope_context_frame(self, context: LLMContext) -> None:
+        """Retrieve + queue-store this turn, both bound to its frozen snapshot.
+
+        Skips ALL Mem0 I/O for an ``unknown`` (or empty) turn so unidentified
+        voices never share one persistent namespace (Codex audit P1). Only the
+        current turn's own user message is stored, under the frozen snapshot.
+        """
+        binding = scoped_turn(context.get_messages())
+        if binding is None:
+            return
+        speaker, text = binding
+        if speaker == "unknown" or not text.strip():
+            return
+        await self._enhance_scoped(context, text, speaker)
+        self.create_task(
+            self._store_scoped([{"role": "user", "content": text}], speaker),
+            name="mem0_store",
+        )
+
+    async def _retrieve_scoped(self, query: str, user_id: str) -> Any:
+        """Search Mem0 under an explicit *user_id* (the turn's frozen snapshot)."""
+        try:
+            params: dict[str, Any] = {
+                "query": query,
+                "user_id": user_id,
+                "limit": self.search_limit,
+            }
+            if self.agent_id:
+                params["agent_id"] = self.agent_id
+            if self.run_id:
+                params["run_id"] = self.run_id
+            return await asyncio.to_thread(lambda: self.memory_client.search(**params))
+        except Exception as e:
+            logger.error(f"Error retrieving memories from Mem0: {e}")
+            return {"results": []}
+
+    async def _store_scoped(self, messages: list[dict[str, Any]], user_id: str) -> None:
+        """Store *messages* under an explicit *user_id* — never the late self.user_id."""
+        try:
+            params: dict[str, Any] = {
+                "messages": messages,
+                "metadata": {"platform": "pipecat"},
+                "user_id": user_id,
+            }
+            if self.agent_id:
+                params["agent_id"] = self.agent_id
+            if self.run_id:
+                params["run_id"] = self.run_id
+            await asyncio.to_thread(lambda: self.memory_client.add(**params))
+        except Exception as e:
+            logger.error(f"Error storing messages in Mem0: {e}")
+
+    async def _enhance_scoped(self, context: LLMContext, query: str, user_id: str) -> None:
+        """Insert the *user_id*-scoped memories into the context before the LLM."""
+        if self.last_query == query:
+            return
+        self.last_query = query
+
+        memories = await self._retrieve_scoped(query, user_id)
+        results = memories.get("results", []) if isinstance(memories, dict) else memories
+        if not results:
+            return
+
+        memory_text = self.system_prompt
+        for i, memory in enumerate(results, 1):
+            memory_text += f"{i}. {memory.get('memory', '')}\n\n"
+
+        role = "system" if self.add_as_system_message else "user"
+        memory_message = cast(LLMContextMessage, {"role": role, "content": memory_text})
+        messages = context.get_messages()
+        position = max(0, min(self.position, len(messages)))
+        messages.insert(position, memory_message)
+        context.set_messages(messages)
+
+
+def make_memory_service(
+    cfg: Config, *, user_id: str = "unknown", scoped: bool = True
+) -> Mem0MemoryService:
     """Return a self-hosted Mem0MemoryService wired into the Pipecat pipeline.
 
     The service uses:
@@ -30,6 +175,11 @@ def make_memory_service(cfg: Config, *, user_id: str = "unknown") -> Mem0MemoryS
       no API key, ONNX runtime in-process.
     - anthropic/claude-haiku-4.5 via OpenRouter for fact extraction — requires
       OPENROUTER_API_KEY (Mem0's OpenAI provider auto-detects it from env).
+
+    ``scoped`` selects ``ScopedMem0MemoryService`` (per-turn speaker binding —
+    the default for the segmented-STT identity path). Pass ``scoped=False`` for
+    the streaming-STT (xAI) path, which has no per-turn ``[speaker: …]`` tag to
+    bind to and so falls back to the base service's single-namespace behaviour.
 
     Blocking Mem0 calls are already wrapped in asyncio.to_thread by the
     Pipecat plugin (pipecat.services.mem0.memory, resolved upstream issue #1741),
@@ -70,7 +220,8 @@ def make_memory_service(cfg: Config, *, user_id: str = "unknown") -> Mem0MemoryS
         },
     }
 
-    return Mem0MemoryService(
+    service_cls = ScopedMem0MemoryService if scoped else Mem0MemoryService
+    return service_cls(
         local_config=local_config,
         user_id=user_id,
     )

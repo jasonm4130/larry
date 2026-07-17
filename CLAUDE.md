@@ -11,14 +11,17 @@ Cursed AI character in a motorized Halloween skull on a Raspberry Pi 5; runs on 
 **Pipeline order:**
 ```
 LocalAudioTransport
-  → SpeakerID (Resemblyzer)
+  → SpeakerID (Resemblyzer)     # audio → identity; snapshots the turn's speaker at VAD-stop
   → GroqSTT
-  → Mem0 (short-term memory)
+  → SpeakerTag                  # tags each transcript with the turn's frozen [speaker: name]
+  → Mem0 (short-term memory)    # scoped per-turn to that snapshot; unknown turns get NO Mem0 I/O
   → OpenAILLM (via OpenRouter → Claude Sonnet 5)
   → ElevenLabsTTS
   → AudioBufferProcessor (tap for jaw sync)
   → transport.output
 ```
+
+**One immutable per-turn identity.** The speaker is identified once at the VAD boundary and that *frozen* value (not a live `current_speaker`) is threaded to the `[speaker: name]` tag, Mem0 retrieval, the Mem0 deferred store, and the conversation log — so none of them cross-attribute a later turn's speaker. `unknown` turns are ephemeral (no Mem0 read/store). This identity path requires **segmented STT** (`STT_PROVIDER=groq`, the default); `STT_PROVIDER=xai` is streaming, logs a loud warning, and disables per-speaker attribution (base single-namespace Mem0). Tag format + parser live in `src/larry/speaker_tag.py`; the tagger is `SpeakerTagProcessor` in `speaker_id.py`; the scoped store is `ScopedMem0MemoryService` in `memory.py`.
 
 **Wake word** ("Hey Larry") gates the pipeline via custom `FrameProcessor` in `wake.py` — OpenWakeWord (Apache-2.0, no API key). Default model `hey_jarvis`. Train a custom "Hey Larry" via the [OpenWakeWord Colab](https://colab.research.google.com/drive/1q1oe2zOyZp7UsB3jJiQ1IFn8z5YfjwEb) and point `WAKE_WORD_CUSTOM_PATH` at the resulting .onnx file.
 

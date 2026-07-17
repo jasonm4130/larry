@@ -38,7 +38,7 @@ A local wake gate guards a pipeline of cloud voice services; a tap on the synthe
 ```mermaid
 flowchart LR
     mic([🎙️ Mic]) --> wake{Wake gate<br/>OpenWakeWord}
-    wake -->|awake| spk[Speaker ID] --> stt[STT] --> mem[Memory] --> llm[LLM] --> tts[TTS] --> spkr([🔊 Speaker])
+    wake -->|awake| spk[Speaker ID] --> stt[STT] --> tag["Speaker tag<br/>#91;speaker: name#93;"] --> mem[Memory] --> llm[LLM] --> tts[TTS] --> spkr([🔊 Speaker])
     tts -. bot audio .-> jaw[Servo jaw]
 ```
 

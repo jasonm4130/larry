@@ -18,7 +18,13 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 import numpy as np
-from pipecat.frames.frames import Frame, StartFrame, TranscriptionFrame
+from pipecat.frames.frames import (
+    Frame,
+    StartFrame,
+    TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -177,7 +183,7 @@ def test_take_turn_snapshot_uses_frozen_task_not_live_current_speaker(monkeypatc
             return value
 
         # This turn's own identification resolved to alice.
-        proc._turn_identify_task = asyncio.create_task(_resolve("alice"))
+        proc._turn_snapshot_queue.append(asyncio.create_task(_resolve("alice")))
         # ...but a *later* turn has since flipped the confirmed speaker to bob.
         proc._current_speaker = "bob"
 
@@ -192,7 +198,7 @@ def test_take_turn_snapshot_no_task_fails_closed_to_unknown(monkeypatch, tmp_pat
     async def body():
         proc = _make_proc(monkeypatch, tmp_path)
         proc._current_speaker = "alice"  # a confirmed speaker is standing...
-        proc._turn_identify_task = None  # ...but this transcript had no turn task.
+        # ...but this transcript had no turn task (queue empty).
         assert await proc.take_turn_snapshot() == "unknown"  # never inherit
 
     asyncio.run(body())
@@ -201,6 +207,55 @@ def test_take_turn_snapshot_no_task_fails_closed_to_unknown(monkeypatch, tmp_pat
 # --------------------------------------------------------------------------
 # (e) an unconfirmed new-speaker turn snapshots unknown, never the prior speaker
 # --------------------------------------------------------------------------
+
+
+def test_take_turn_snapshot_fifo_survives_racing_vad_stops(monkeypatch, tmp_path):
+    """Regression (Codex P2): SpeakerIDProcessor sits upstream of STT and can
+    race ahead of it, so a second VAD-stop can queue turn N+1's identify task
+    before turn N's transcript ever reaches the tagger. The old single-slot
+    design (``self._turn_identify_task = task``) let turn N+1 overwrite turn
+    N's result the instant its task was created, regardless of when (or
+    whether) anyone had read turn N's snapshot yet — mis-attributing turn N's
+    tag to turn N+1's speaker. The FIFO queue must return each turn's own
+    result in turn order, independent of when the next turn's task is queued.
+    """
+
+    async def body():
+        alice = np.array([1.0, 0.0], dtype=np.float32)
+        bob = np.array([0.0, 1.0], dtype=np.float32)
+
+        def embed_by_content(audio_f32_16k):
+            return alice if audio_f32_16k[0] > 0 else bob
+
+        fake = _FakeEmbedder()
+        fake.embed = embed_by_content
+        monkeypatch.setattr(speaker_id, "get_speaker_embedder", lambda name: fake)
+        # change_turns=1 so a single turn confirms immediately -- isolates the
+        # queue-ordering fix from hysteresis smoothing.
+        proc = SpeakerIDProcessor(speakers_db_path=tmp_path / "speakers.db", change_turns=1)
+        proc._enrolled = {"alice": alice, "bob": bob}
+
+        a_bytes = np.array([10000, 0], dtype=np.int16).tobytes()  # -> alice
+        b_bytes = np.array([-10000, 0], dtype=np.int16).tobytes()  # -> bob
+
+        # Turn N (alice) closes: its identify task is queued.
+        await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        proc._turn_audio = bytearray(a_bytes)
+        await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+        # Turn N+1 (bob) races ahead of STT and closes -- its own task is
+        # queued -- before anything has read turn N's snapshot.
+        await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        proc._turn_audio = bytearray(b_bytes)
+        await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+        # Turn N's transcript finally arrives at the tagger: must get turn
+        # N's own identity (alice), never turn N+1's (bob).
+        assert await proc.take_turn_snapshot() == "alice"
+        # Turn N+1's transcript arrives next: gets its own identity.
+        assert await proc.take_turn_snapshot() == "bob"
+
+    asyncio.run(body())
 
 
 def test_unconfirmed_new_speaker_turn_snapshots_unknown(monkeypatch, tmp_path):

@@ -204,7 +204,12 @@ def load_config() -> Config:
     xai_api_key = os.environ.get("XAI_API_KEY")
     # Default model depends on active provider — xAI's grok-4.20 non-reasoning
     # variant is the fast/cheap pick when routing direct, Claude Sonnet 5
-    # remains the OpenRouter fallback.
+    # remains the OpenRouter fallback. Both this slug and elevenlabs_model's
+    # default below were only WebSearch-checked, not live-API-verified, when
+    # first set (no keys in the dev sandbox); confirmed resolvable via the
+    # OpenRouter (openrouter.ai/anthropic/claude-sonnet-5) and ElevenLabs
+    # model listings as of 2026-07-18. Re-verify on the next model bump —
+    # LLM_MODEL / ELEVENLABS_MODEL are the escape hatch if either goes stale.
     default_llm = "grok-4.20-non-reasoning" if xai_api_key else "anthropic/claude-sonnet-5"
 
     return Config(

@@ -6,6 +6,7 @@ via SPEAKER_EMBEDDER — this module never calls a specific model's SDK.
 
 import asyncio
 import sqlite3
+from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from time import monotonic as _monotonic
@@ -188,11 +189,18 @@ class SpeakerIDProcessor(FrameProcessor):
         # embedding is inherently tied to its own turn — no rolling window that
         # straddles turns, no post-hoc result landing on the wrong turn.
         self._turn_audio: bytearray = bytearray()
-        # Holds THIS turn's identity result (a Task from the embed, or a resolved
-        # Future for turns we don't identify).  take_turn_snapshot awaits it so
-        # the downstream tagger reads the turn's own frozen identity, not a live
-        # current_speaker that a later turn may already have flipped.
-        self._turn_identify_task: asyncio.Future[str] | None = None
+        # FIFO of pending per-turn identity results (a Task from the embed, or a
+        # resolved Future for turns we don't identify) — one entry appended per
+        # VADUserStoppedSpeakingFrame, oldest-first. take_turn_snapshot pops the
+        # head, not a shared "latest" slot: SpeakerIDProcessor sits upstream of
+        # STT and can race ahead of it, so a second VAD-stop can arrive (and, in
+        # a single-slot design, overwrite the result) before the first turn's
+        # TranscriptionFrame reaches the downstream tagger. STT preserves turn
+        # order, so matching queue-order to transcript-order (rather than
+        # reading whatever is "current" when the transcript shows up) is what
+        # keeps a turn's tag bound to its own identification, never a
+        # since-overwritten one (Codex P2).
+        self._turn_snapshot_queue: deque[asyncio.Future[str]] = deque()
 
         # _current_speaker is the *confirmed* speaker: it switches only after
         # hysteresis commits a new one, never on a single stray turn.
@@ -236,22 +244,25 @@ class SpeakerIDProcessor(FrameProcessor):
         return self._current_speaker
 
     async def take_turn_snapshot(self) -> str:
-        """Return the frozen identity of the most recently ended turn.
+        """Return the frozen identity of the *oldest still-pending* turn.
 
         The downstream SpeakerTagProcessor calls this when a TranscriptionFrame
         arrives, so the tag binds to *that* turn's own identification (awaited,
         bounded) — never a live ``current_speaker`` read, which a later turn's
         identify could already have flipped to a different speaker (Codex P2).
+        Popped FIFO from ``_turn_snapshot_queue`` rather than read off a shared
+        "latest" attribute, so a second VAD-stop racing ahead of STT can never
+        overwrite the result this call is waiting on.
 
-        Fails closed to ``'unknown'`` if there is no turn task yet, if the embed
+        Fails closed to ``'unknown'`` if the queue is empty, if the embed
         overruns ``_SNAPSHOT_AWAIT_TIMEOUT_S``, or if it errored — an unattributed
         turn is safe (Larry has a new-voice register); a wrong name is not. The
         embed is ``shield``ed so a wait-timeout here never cancels it: it keeps
         running to update the hysteresis streak for subsequent turns.
         """
-        task = self._turn_identify_task
-        if task is None:
+        if not self._turn_snapshot_queue:
             return "unknown"
+        task = self._turn_snapshot_queue.popleft()
         try:
             return await asyncio.wait_for(asyncio.shield(task), _SNAPSHOT_AWAIT_TIMEOUT_S)
         except (TimeoutError, asyncio.CancelledError):
@@ -314,16 +325,17 @@ class SpeakerIDProcessor(FrameProcessor):
             # busy with the enroll embed, and identifying the enrollment phrase is
             # pointless.  (_encoder_lock would serialize them safely anyway — this
             # just avoids the wasted embed and keeps enrollment turns out of the
-            # hysteresis streak.)  Either way, set _turn_identify_task to THIS
-            # turn's result so take_turn_snapshot never hands the downstream
-            # tagger a stale prior turn's identity: an enrollment turn resolves
-            # to 'unknown' rather than inheriting the last confirmed speaker.
+            # hysteresis streak.)  Either way, enqueue THIS turn's result (FIFO,
+            # never overwriting a still-pending prior turn) so take_turn_snapshot
+            # never hands the downstream tagger a stale or later turn's identity:
+            # an enrollment turn resolves to 'unknown' rather than inheriting the
+            # last confirmed speaker.
             if self._capture_state == "idle":
-                self._turn_identify_task = asyncio.create_task(self._identify_turn(turn_bytes))
+                self._turn_snapshot_queue.append(asyncio.create_task(self._identify_turn(turn_bytes)))
             else:
                 unknown: asyncio.Future[str] = asyncio.get_running_loop().create_future()
                 unknown.set_result("unknown")
-                self._turn_identify_task = unknown
+                self._turn_snapshot_queue.append(unknown)
             await self.push_frame(frame, direction)
 
         else:

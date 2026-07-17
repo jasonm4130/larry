@@ -159,3 +159,38 @@ def test_system_message_always_survives_a_reset():
         assert roles.count("system") == 1
 
     asyncio.run(body())
+
+
+def test_injected_memory_system_messages_are_dropped_on_reset():
+    """Regression: `ScopedMem0MemoryService` injects each turn's retrieved
+    Mem0 memories as an *additional* system message (position 1, not the
+    base prompt at position 0). A reset that kept every role=='system'
+    message would retain alice's injected memories across the boundary into
+    bob's turn — the exact cross-speaker leak this module exists to close,
+    resurfacing through the memory-injection channel instead of raw turns.
+    """
+
+    async def body():
+        snap = {"value": "alice"}
+        pipeline, context = _build(snap)
+
+        await _send_turn(pipeline, "hi, alice here")
+        # Simulate ScopedMem0MemoryService inserting alice's retrieved
+        # memories as a system message alongside the base prompt.
+        messages = context.get_messages()
+        messages.insert(1, {"role": "system", "content": "alice's private facts"})
+        context.set_messages(messages)
+
+        snap["value"] = "bob"  # confirmed switch
+        await _send_turn(pipeline, "hi, bob here")
+
+        remaining = context.get_messages()
+        system_contents = [
+            m.get("content") for m in remaining if isinstance(m, dict) and m.get("role") == "system"
+        ]
+        assert system_contents == ["sys"]  # only the base prompt survives
+        assert not any(
+            "alice" in str(m.get("content", "")) for m in remaining if isinstance(m, dict)
+        )
+
+    asyncio.run(body())

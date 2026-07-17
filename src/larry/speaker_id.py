@@ -17,6 +17,7 @@ from loguru import logger
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    ErrorFrame,
     Frame,
     InputAudioRawFrame,
     STTMuteFrame,
@@ -661,9 +662,12 @@ class SpeakerTagProcessor(FrameProcessor):
     "latest" slot) is required because ``IdentitySnapshotFrame`` is a
     ``SystemFrame`` processed inline: a second turn's marker can be handled
     before the first turn's queued ``TranscriptionFrame`` is dequeued, so order
-    — not recency — is what binds each transcript to its turn. Orphans can't
-    accumulate: ``SpeakerIDProcessor`` emits a marker only for turns the STT
-    will transcribe, so markers and transcripts stay 1:1.
+    — not recency — is what binds each transcript to its turn. Markers and
+    transcripts stay 1:1 because ``SpeakerIDProcessor`` emits one marker per
+    VAD-stop and the STT (``push_empty_transcripts=True``) emits one transcript
+    per turn; a rare STT *error* (an ``ErrorFrame`` in place of a transcript)
+    drops that turn's marker here, and a ``BotStartedSpeakingFrame`` backstop
+    clears any residual orphan so a 1:1 break can never outlast one turn.
 
     ``apply_boundary`` (Task 6) is applied to each resolved snapshot to drop the
     prior speaker's turns from the shared context on a continuity break. The tag
@@ -684,6 +688,28 @@ class SpeakerTagProcessor(FrameProcessor):
             # consume the frame (it is an internal handoff, never forwarded).
             if frame.snapshot is not None:
                 self._pending.append(frame.snapshot)
+            return
+        if isinstance(frame, ErrorFrame):
+            # A raw STT error yields an ErrorFrame in place of this turn's
+            # transcript (push_empty_transcripts only covers an *empty* result,
+            # not a failed round-trip). The marker just enqueued for that turn
+            # would otherwise be popped by the NEXT turn's transcript and shift
+            # attribution, so discard it. ErrorFrame arrives after the failed
+            # round-trip that separates it from any prior turn's already-tagged
+            # transcript, so the front entry is this errored turn's.
+            if self._pending:
+                self._pending.popleft()
+            await self.push_frame(frame, direction)
+            return
+        if isinstance(frame, BotStartedSpeakingFrame):
+            # Backstop: by the time Larry begins speaking, the user turn that
+            # prompted him is fully transcribed and its marker consumed, so
+            # `_pending` is normally empty here. Any residual entry is a stranded
+            # orphan (a rare 1:1 break the handlers above didn't catch); dropping
+            # it bounds the damage to a single turn rather than the rest of the
+            # session. Fires on the upstream-travelling frame; forward unchanged.
+            self._pending.clear()
+            await self.push_frame(frame, direction)
             return
         if isinstance(frame, TranscriptionFrame):
             pending = self._pending.popleft() if self._pending else None

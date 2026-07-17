@@ -26,6 +26,8 @@ from typing import Any
 
 import numpy as np
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    ErrorFrame,
     Frame,
     InputAudioRawFrame,
     StartFrame,
@@ -175,6 +177,53 @@ def test_tagger_pops_pending_snapshots_in_fifo_order():
         await asyncio.sleep(0)
 
         assert _transcriptions(sink) == ["[speaker: alice] first", "[speaker: bob] second"]
+
+    _run(body)
+
+
+def test_error_frame_drops_orphan_marker():
+    """An STT ErrorFrame arrives in place of a failed turn's transcript (Codex
+    diff P1). The tagger must drop that turn's marker, so the NEXT turn's
+    transcript is tagged with its own identity, not the errored turn's."""
+
+    async def body():
+        tagger = SpeakerTagProcessor(_passthrough, enable_direct_mode=True)
+        sink = _Sink()
+        await _link(tagger, sink)
+
+        # Turn A's marker, then its transcription errors (no transcript).
+        await tagger.process_frame(_identity("alice"), FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(ErrorFrame(error="groq 500"), FrameDirection.DOWNSTREAM)
+        # Turn B: its own marker + transcript must tag bob, not alice.
+        await tagger.process_frame(_identity("bob"), FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(_transcription("this is bob"), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0)
+
+        assert _transcriptions(sink) == ["[speaker: bob] this is bob"]
+
+    _run(body)
+
+
+def test_bot_started_clears_stranded_orphan():
+    """Backstop: a stranded marker (a 1:1 break the ErrorFrame handler didn't
+    catch) is cleared when Larry next starts speaking, so it can't desync later
+    turns. Without the backstop, bob's turn would pop the stranded alice marker."""
+
+    async def body():
+        tagger = SpeakerTagProcessor(_passthrough, enable_direct_mode=True)
+        sink = _Sink()
+        await _link(tagger, sink)
+
+        # An orphan marker with no transcript and no error to clear it.
+        await tagger.process_frame(_identity("alice"), FrameDirection.DOWNSTREAM)
+        # Larry begins speaking -> the backstop clears the stranded orphan.
+        await tagger.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        # Bob's turn is now tagged with its own identity.
+        await tagger.process_frame(_identity("bob"), FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(_transcription("bob now"), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0)
+
+        assert _transcriptions(sink) == ["[speaker: bob] bob now"]
 
     _run(body)
 

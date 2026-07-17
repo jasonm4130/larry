@@ -64,6 +64,7 @@ import larry.speaker_id as speaker_id_module
 from larry import awareness, self_layer, voice_enroll
 from larry.audio_filter import WebRTCEchoCancellationFilter
 from larry.config import load_config
+from larry.context_boundary import make_boundary_snapshot_provider
 from larry.hardware import get_jaw_driver
 from larry.jaw import JawAmplitudeMapper
 from larry.memory import ConversationLog, make_memory_service
@@ -557,9 +558,20 @@ async def run() -> None:
     # finding #2 never did) and BEFORE WhisperHallucinationFilter (whose
     # ^[speaker:…] strip is non-mutating), so the tag rides frame.text all the
     # way into the LLM context.  Segmented STT only; skipped on the xAI path.
+    #
+    # The snapshot provider is wrapped with the Task 6 context boundary: on a
+    # continuity break (confirmed speaker change, or an unconfirmed 'unknown'
+    # turn following a different standing speaker) it drops every prior raw
+    # user/assistant turn from `context` before this turn's tagged transcript
+    # reaches user_agg — so the new turn is appended onto a clean slate rather
+    # than replaying another person's transcript to the LLM.
     post_stt: list = [stt]
     if not _use_xai_stt:
-        post_stt.append(SpeakerTagProcessor(speaker_id.take_turn_snapshot))
+        post_stt.append(
+            SpeakerTagProcessor(
+                make_boundary_snapshot_provider(speaker_id.take_turn_snapshot, context)
+            )
+        )
     post_stt.append(WhisperHallucinationFilter())
 
     pipeline = Pipeline(

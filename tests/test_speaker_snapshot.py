@@ -251,9 +251,13 @@ def _muted_echo_turn(sample: int) -> list[Frame]:
 
 
 async def _drive(proc: SpeakerIDProcessor, frames: list[Frame]) -> list[str]:
-    """Run *frames* through proc -> tagger and return the tagged transcripts."""
+    """Run *frames* through proc -> tagger -> hallucination filter (the real
+    post-STT order) and return the surviving tagged transcripts. The filter
+    drops empty transcripts, exactly as it does in production, so the empty
+    transcript push_empty_transcripts emits for a silent/echo turn never shows
+    up here."""
     tagger = SpeakerTagProcessor(_passthrough)
-    pipeline = Pipeline([proc, tagger])
+    pipeline = Pipeline([proc, tagger, WhisperHallucinationFilter()])
     down, _ = await run_test(
         pipeline,
         frames_to_send=frames,
@@ -261,6 +265,18 @@ async def _drive(proc: SpeakerIDProcessor, frames: list[Frame]) -> list[str]:
         send_end_frame=True,
     )
     return [f.text for f in down if isinstance(f, TranscriptionFrame)]
+
+
+async def _markers(proc: SpeakerIDProcessor, frames: list[Frame]) -> int:
+    """Count the IdentitySnapshotFrames proc emits for *frames* (no tagger, so
+    the markers flow through to the collected downstream frames)."""
+    down, _ = await run_test(
+        Pipeline([proc]),
+        frames_to_send=frames,
+        expected_down_frames=None,
+        send_end_frame=True,
+    )
+    return sum(isinstance(f, IdentitySnapshotFrame) for f in down)
 
 
 def _make_id_proc(monkeypatch, tmp_path, alice, bob, **kwargs) -> SpeakerIDProcessor:
@@ -316,14 +332,40 @@ def test_racing_vad_stops_preserve_turn_order(monkeypatch, tmp_path):
     asyncio.run(body())
 
 
+def test_marker_emitted_once_per_vad_stop(monkeypatch, tmp_path):
+    """Regression (Critical / P1-a): exactly one IdentitySnapshotFrame per
+    VAD-stop — a muted bot-echo turn included. Paired with push_empty_transcripts
+    (one transcript per VAD turn), that keeps markers and transcripts 1:1 so the
+    tagger's pending FIFO can never drift. A design that skipped the marker for
+    muted (or empty-transcript) turns would emit fewer markers than transcripts
+    and permanently mis-align attribution."""
+
+    async def body():
+        alice = np.array([1.0, 0.0], dtype=np.float32)
+        bob = np.array([0.0, 1.0], dtype=np.float32)
+        proc = _make_id_proc(monkeypatch, tmp_path, alice, bob)
+
+        count = await _markers(
+            proc,
+            [
+                *_real_turn(_ALICE_SAMPLE),
+                *_muted_echo_turn(_ALICE_SAMPLE),  # muted echo STILL emits a marker
+                *_real_turn(_BOB_SAMPLE),
+            ],
+        )
+        assert count == 3  # one per VAD-stop: alice, muted echo, bob
+
+    asyncio.run(body())
+
+
 def test_muted_echo_turn_does_not_desync_attribution(monkeypatch, tmp_path):
-    """Regression (Critical): a fully-muted bot-echo turn produces a VAD-stop but
-    no transcript. If it emitted an IdentitySnapshotFrame, that orphan would sit
-    in the tagger's pending FIFO and every later turn's transcript would pop the
-    wrong (previous) turn's identity — permanent per-session mis-attribution,
-    the exact cross-speaker bug this branch exists to prevent. The mute-gated
-    marker emission means the echo turn emits nothing, so bob's turn after it is
-    still tagged bob, not alice."""
+    """Regression (Critical): a muted bot-echo turn emits a marker (resolving to
+    'unknown', no embed) AND — via push_empty_transcripts — an empty transcript
+    that pops it. Markers and transcripts stay 1:1, so bob's turn after the echo
+    is still tagged bob, not shifted onto the echo's (or alice's) identity. If
+    the echo emitted a transcript but no marker (or vice versa), the FIFO would
+    drift and mis-attribute every later turn — the cross-speaker bug this branch
+    exists to prevent."""
 
     async def body():
         alice = np.array([1.0, 0.0], dtype=np.float32)
@@ -335,11 +377,11 @@ def test_muted_echo_turn_does_not_desync_attribution(monkeypatch, tmp_path):
             [
                 *_real_turn(_ALICE_SAMPLE),
                 _transcription("alice speaking"),
-                # Bot echo while muted -> no transcript, no marker. Its audio is
-                # given a DIFFERENT identity (alice) than the next real speaker
-                # (bob) so that an orphan marker, if wrongly emitted, would visibly
-                # mis-tag bob's turn as alice rather than coincidentally matching.
+                # Bot echo while muted: marker (unknown) + the empty transcript
+                # push_empty_transcripts emits, which pops that marker and is then
+                # dropped by the hallucination filter.
                 *_muted_echo_turn(_ALICE_SAMPLE),
+                _transcription(""),
                 *_real_turn(_BOB_SAMPLE),
                 _transcription("now bob"),
             ],

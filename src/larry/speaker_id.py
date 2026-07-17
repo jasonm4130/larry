@@ -55,9 +55,14 @@ class IdentitySnapshotFrame(SystemFrame):
     would sit in the queue and arrive only after STT had already emitted the
     transcript, too late to tag it.
 
+    One marker is emitted per VAD-stop, paired 1:1 with the single transcript
+    the STT emits per turn (``push_empty_transcripts=True``), so the tagger's
+    pending FIFO stays aligned regardless of transcript content.
+
     ``snapshot`` is an awaitable resolving to this turn's identity: an
     ``asyncio.Task`` from the turn-scoped embed, or a pre-resolved future for a
-    turn we deliberately do not identify (e.g. an enrollment-capture turn).
+    turn we deliberately do not identify (a muted bot-echo turn, or an
+    enrollment-capture turn).
     """
 
     snapshot: "Awaitable[str] | None" = None
@@ -245,16 +250,14 @@ class SpeakerIDProcessor(FrameProcessor):
         self._turn_audio: bytearray = bytearray()
         # Whether STT is currently muted (bot speaking + cool-down trail),
         # tracked from the STTMuteFrame that STTMuteOnBotSpeech emits and that
-        # flows through here on its way to the STT service. Gates marker
-        # emission: a fully-muted turn (acoustic bot-echo) is dropped by the STT
-        # and yields no transcript, so it must yield no IdentitySnapshotFrame
-        # either — else the tagger's pending FIFO would gain an entry no
-        # transcript ever pops, permanently mis-aligning every later turn.
+        # flows through here on its way to the STT service.
         self._stt_muted: bool = False
         # True once this turn accumulates voiced audio while un-muted — i.e.
-        # audio the STT will actually transcribe. A turn that never sees an
-        # un-muted voiced frame (pure echo during bot speech/cool-down) emits no
-        # marker. Reset at each VAD-start.
+        # real speech the STT heard, worth embedding. A turn that never sees an
+        # un-muted voiced frame (pure echo during bot speech/cool-down) still
+        # emits a marker, but resolves to 'unknown' without an embed, so echo
+        # neither burns the encoder nor pollutes the hysteresis streak. Reset at
+        # each VAD-start.
         self._turn_saw_unmuted: bool = False
 
         # _current_speaker is the *confirmed* speaker: it switches only after
@@ -358,21 +361,30 @@ class SpeakerIDProcessor(FrameProcessor):
             self._turn_audio = bytearray()
             saw_unmuted = self._turn_saw_unmuted
             self._turn_saw_unmuted = False
-            # Emit this turn's identity in-band ONLY for turns the STT will
-            # transcribe: identification enabled (segmented-STT path) AND the
-            # turn had voiced, un-muted audio. A fully-muted bot-echo turn yields
-            # no transcript, so emitting a marker for it would leave an orphan
-            # the tagger never consumes — permanently desyncing every later turn
-            # (the FIFO-drift bug this guard closes). The marker is a SystemFrame
-            # pushed BEFORE the VAD-stop so it reaches the tagger ahead of the
-            # transcript. The embedded bytes are snapshotted here (by value), so
-            # a late-completing embed still attributes to this turn, never a
-            # later one. Enrollment-capture turns are voiced+un-muted (so they
-            # ARE transcribed and DO need a marker) but resolve to 'unknown'
-            # rather than inheriting the last confirmed speaker.
-            if self._identify_enabled and saw_unmuted:
+            # Emit this turn's identity in-band, ahead of its transcript, on
+            # EVERY VAD-stop (segmented-STT path only). The Groq STT is
+            # configured with push_empty_transcripts=True, so every VAD turn
+            # yields exactly one TranscriptionFrame — including a muted bot-echo
+            # turn (empty, later dropped by WhisperHallucinationFilter) or a
+            # silent turn Whisper transcribes to "". One marker per VAD-stop
+            # therefore keeps markers and transcripts 1:1, so the tagger's FIFO
+            # never drifts regardless of transcript content. (The one residual:
+            # a raw Groq API error yields an ErrorFrame, not a transcript — a
+            # rare, conversation-disrupting event that can orphan a single
+            # marker; not worth an unsafe inline reconciliation to catch.) The
+            # marker is a SystemFrame pushed BEFORE the VAD-stop so it reaches
+            # the tagger ahead of the transcript.
+            #
+            # Run the (costly, torch) embed only for turns with voiced, un-muted
+            # audio the STT actually heard. A muted echo turn or an enrollment
+            # turn resolves to 'unknown' by value — never inheriting the last
+            # confirmed speaker, and never letting echo pollute the hysteresis
+            # streak. The embedded bytes are snapshotted here (by value), so a
+            # late-completing embed still attributes to this turn, never a later
+            # one.
+            if self._identify_enabled:
                 snapshot: Awaitable[str]
-                if self._capture_state == "idle":
+                if saw_unmuted and self._capture_state == "idle":
                     snapshot = asyncio.create_task(self._identify_turn(turn_bytes))
                 else:
                     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()

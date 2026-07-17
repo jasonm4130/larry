@@ -428,6 +428,13 @@ async def run() -> None:
                 prompt="Voice dictation transcript.",
             ),
             include_prob_metrics=True,
+            # Emit a TranscriptionFrame even when Whisper returns "" so every VAD
+            # turn yields exactly one transcript. That keeps the SpeakerID
+            # identity markers (one per VAD-stop) 1:1 with transcripts, so the
+            # SpeakerTagProcessor FIFO can't drift on a silent/empty turn. The
+            # empty text is dropped just downstream by WhisperHallucinationFilter
+            # ("" is in its denylist), so it never reaches the LLM.
+            push_empty_transcripts=True,
         )
     # temperature=0.7 (down from default 1.0) modestly reduces persona
     # drift / off-topic riffing per Anthropic's "Assistant Axis" findings.

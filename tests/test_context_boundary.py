@@ -116,10 +116,13 @@ def test_unknown_turn_after_a_different_standing_speaker_drops_context():
     asyncio.run(body())
 
 
-def test_consecutive_unknown_turns_do_not_repeatedly_reset():
-    """Two 'unknown' turns in a row (nobody yet identified) is not a change in
-    the standing speaker, so the second turn's own content is not wiped out
-    by a redundant reset."""
+def test_consecutive_unknown_turns_each_reset_to_isolate_strangers():
+    """Two 'unknown' turns in a row are treated as potentially DIFFERENT
+    unproven voices: 'unknown' carries no identity, so we cannot assume the
+    second turn is the same stranger continuing. Each unknown turn therefore
+    resets — the first turn's content is gone by the time the second is
+    appended. This is the P1-b decision: never let two different guests share
+    context, at the cost of a single stranger's own cross-turn continuity."""
 
     async def body():
         pipeline, context = _build()
@@ -128,7 +131,7 @@ def test_consecutive_unknown_turns_do_not_repeatedly_reset():
         await _send_turn(pipeline, "unknown", "second unknown turn")
 
         contents = _user_contents(context)
-        assert any("first unknown turn" in c for c in contents)
+        assert not any("first unknown turn" in c for c in contents)
         assert any("second unknown turn" in c for c in contents)
 
     asyncio.run(body())

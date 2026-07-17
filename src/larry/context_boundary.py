@@ -24,6 +24,12 @@ neither stored in Mem0 nor retained in the LLM context by the time Larry
 replies to turn 2 — only the SQLite `ConversationLog` keeps it. This is the
 fail-closed cost of never mis-attributing an unconfirmed turn; it is not fixed
 by this module.
+
+Second accepted tradeoff (P1-b): every 'unknown' turn resets, so a lone
+stranger speaking across several still-unconfirmed turns also loses continuity
+between their own turns — the price of guaranteeing two different guests can
+never share context. Their turns still land in `ConversationLog`; only the live
+LLM context is reset.
 """
 
 from collections.abc import Callable
@@ -40,13 +46,14 @@ def make_context_boundary(context: LLMContext) -> Callable[[str], str]:
     previous turn's — the "standing" speaker whose raw turns currently live in
     context — and returns the snapshot unchanged. Given `SpeakerIDProcessor`'s
     hysteresis (a snapshot is the confirmed speaker only when this turn's own
-    identification agrees with it, else 'unknown'), a change in that value is
-    exactly the plan's two trigger conditions:
+    identification agrees with it, else 'unknown'), it resets on:
       - a confirmed switch to a new named speaker, or
-      - an unconfirmed ('unknown') turn following a different (named) standing
-        speaker.
-    Two identical 'unknown' turns in a row (nobody yet identified) is not a
-    change, so it does not force a redundant reset.
+      - any 'unknown' turn — including one following another 'unknown'. Because
+        'unknown' carries no identity, two consecutive unknowns may be two
+        DIFFERENT unproven voices, so neither shares context with the other
+        (P1-b: isolate strangers even from each other).
+    Only a named turn that matches the standing named speaker continues without
+    a reset.
 
     Must be applied *before* the turn's tagged transcript reaches the user
     aggregator (i.e. inside `SpeakerTagProcessor`, which sits upstream of it) so
@@ -65,7 +72,12 @@ def make_context_boundary(context: LLMContext) -> Callable[[str], str]:
     standing: dict[str, str] = {"value": "unknown"}
 
     def apply(snapshot: str) -> str:
-        if snapshot != standing["value"]:
+        # Reset on any continuity break, AND on every 'unknown' turn: 'unknown'
+        # carries no identity, so two consecutive unknowns may be two DIFFERENT
+        # unproven voices — we cannot assume the second is the first continuing,
+        # so neither shares context (P1-b). A named turn matching the standing
+        # named speaker is the only case that continues without a reset.
+        if snapshot == "unknown" or snapshot != standing["value"]:
             before = context.get_messages()
             base_system = next(
                 (m for m in before if isinstance(m, dict) and m.get("role") == "system"), None

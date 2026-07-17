@@ -8,8 +8,8 @@ Two LLM function tools, registered alongside keep_about_self:
   dismiss()             — makes Larry go to sleep immediately (same dormant
                           state as the wake-gate silence timeout).
 
-The Resemblyzer embed and the sleep_now() call are injected so this module is
-unit-testable without audio, torch, or the pipeline runtime.
+The speaker embedder's embed() and the sleep_now() call are injected so this
+module is unit-testable without audio, torch, or the pipeline runtime.
 
 See docs/superpowers/specs/2026-06-05-voice-enrollment-and-dismiss-design.md.
 """
@@ -58,6 +58,7 @@ def enrollment_instruction(phrase: str) -> str:
 # Tool schema factory
 # ---------------------------------------------------------------------------
 
+
 def build_voice_tools() -> ToolsSchema:
     """Build ToolsSchema for both voice tools (enroll_speaker + dismiss)."""
     enroll_fn = FunctionSchema(
@@ -92,6 +93,7 @@ def build_voice_tools() -> ToolsSchema:
 # ---------------------------------------------------------------------------
 # Handler factories
 # ---------------------------------------------------------------------------
+
 
 def make_enroll_speaker_handler(
     *,

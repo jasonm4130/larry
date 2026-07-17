@@ -1,11 +1,15 @@
-"""Unit tests for SpeakerIDProcessor's pure speaker-matching logic.
+"""Unit tests for SpeakerIDProcessor's speaker-matching + hysteresis logic.
 
 Self-contained: no heavy ML models, no audio devices, no network. The
-Resemblyzer ``VoiceEncoder`` is monkeypatched with a fake whose embedding
-output is fully controlled, so no torch model ever loads. We exercise
-``_identify_speaker`` directly (synchronous matching logic) rather than the
-async audio-buffering path.
+SpeakerEmbedder is monkeypatched (via ``get_speaker_embedder``) with a fake
+whose embedding output is fully controlled, so no torch model ever loads. We
+exercise the pure decision helpers (``_candidate`` for threshold/margin,
+``_resolve_identity`` for cross-turn hysteresis) directly, and drive the async
+per-turn embed (``_identify_turn``) only where gating / turn-scoping /
+encoder-serialization behaviour is under test.
 """
+
+import sqlite3
 
 import numpy as np
 import pytest
@@ -14,113 +18,288 @@ import larry.speaker_id as speaker_id
 from larry.speaker_id import SpeakerIDProcessor, load_enrolled, store_speaker
 
 
-class _FakeEncoder:
-    """Stand-in for Resemblyzer's VoiceEncoder.
+class _FakeEmbedder:
+    """Stand-in for a SpeakerEmbedder (e.g. ResemblyzerEmbedder).
 
-    ``embed_utterance`` ignores its audio input and returns a fixed vector set
-    on the instance, letting tests drive the cosine-similarity decision.
+    ``embed`` ignores its audio input and returns a fixed vector set on the
+    instance, letting tests drive the cosine-similarity decision.
     """
 
+    name = "resemblyzer"
     next_embedding: np.ndarray = np.zeros(4, dtype=np.float32)
 
-    def embed_utterance(self, audio: np.ndarray) -> np.ndarray:
+    def embed(self, audio_f32_16k: np.ndarray, /) -> np.ndarray:
+        # Positional-only: tests reassign `fake.embed` to helper fns whose param
+        # is named differently (e.g. `audio`); the embedder is always called
+        # positionally, so pyright shouldn't require a matching keyword name.
         return self.next_embedding
+
+
+def _patch_embedder(monkeypatch, module=speaker_id) -> _FakeEmbedder:
+    """Monkeypatch ``get_speaker_embedder`` to hand back one fixed fake instance."""
+    fake = _FakeEmbedder()
+    monkeypatch.setattr(module, "get_speaker_embedder", lambda name: fake)
+    return fake
 
 
 @pytest.fixture
 def processor(monkeypatch, tmp_path):
-    """A SpeakerIDProcessor wired to a fake encoder and empty on-disk DB.
+    """A SpeakerIDProcessor wired to a fake embedder and empty on-disk DB.
 
-    ``VoiceEncoder`` is replaced before construction so ``__init__`` never
-    touches torch. The returned processor's ``_enrolled`` dict is populated
-    directly in each test.
+    ``get_speaker_embedder`` is replaced before construction so ``__init__``
+    never touches torch. The returned processor's ``_enrolled`` dict is
+    populated directly in each test.
     """
-    monkeypatch.setattr(speaker_id, "VoiceEncoder", _FakeEncoder)
+    _patch_embedder(monkeypatch)
     proc = SpeakerIDProcessor(speakers_db_path=tmp_path / "speakers.db")
     return proc
 
 
-def test_near_match_returns_enrolled_name(processor):
-    # Stored speaker embedding.
-    alice = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    processor._enrolled = {"alice": alice}
-
-    # Incoming embedding nearly parallel to alice: cosine ~ 0.997 >= 0.75.
-    processor._encoder.next_embedding = np.array([0.95, 0.08, 0.0, 0.0], dtype=np.float32)
-
-    processor._identify_speaker(b"\x00\x00")
-
-    assert processor._current_speaker == "alice"
+# ---------------------------------------------------------------------------
+# Per-turn candidate resolution: threshold + top1-top2 margin + single-candidate
+# waiver.  _candidate() is the pure match decision, independent of hysteresis.
+# ---------------------------------------------------------------------------
 
 
-def test_picks_best_among_several(processor):
+def test_candidate_near_match_returns_enrolled_name(processor):
+    processor._enrolled = {"alice": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)}
+    # Nearly parallel to alice: cosine ~0.997 >= 0.75; single candidate → margin waived.
+    incoming = np.array([0.95, 0.08, 0.0, 0.0], dtype=np.float32)
+    assert processor._candidate(incoming) == "alice"
+
+
+def test_candidate_picks_best_among_several(processor):
     processor._enrolled = {
         "alice": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
         "bob": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
     }
-    # Closest to bob.
-    processor._encoder.next_embedding = np.array([0.05, 0.99, 0.0, 0.0], dtype=np.float32)
-
-    processor._identify_speaker(b"\x00\x00")
-
-    assert processor._current_speaker == "bob"
+    # Almost exactly bob: score ~1.0 vs ~0.05 → wide margin.
+    incoming = np.array([0.05, 0.99, 0.0, 0.0], dtype=np.float32)
+    assert processor._candidate(incoming) == "bob"
 
 
-def test_dissimilar_embedding_returns_unknown(processor):
+def test_candidate_dissimilar_returns_unknown(processor):
     processor._enrolled = {"alice": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)}
-
-    # Orthogonal to alice: cosine ~ 0.0 < 0.75.
-    processor._encoder.next_embedding = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
-
-    processor._identify_speaker(b"\x00\x00")
-
-    assert processor._current_speaker == "unknown"
+    # Orthogonal to alice: cosine ~0.0 < 0.75.
+    incoming = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    assert processor._candidate(incoming) == "unknown"
 
 
-def test_no_enrolled_speakers_stays_unknown(processor):
+def test_candidate_no_enrolled_speakers_is_unknown(processor):
     processor._enrolled = {}
-    processor._encoder.next_embedding = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-
-    processor._identify_speaker(b"\x00\x00")
-
-    assert processor._current_speaker == "unknown"
+    incoming = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    assert processor._candidate(incoming) == "unknown"
 
 
-def test_speaker_change_callback_fires_with_matched_name(monkeypatch, tmp_path):
-    monkeypatch.setattr(speaker_id, "VoiceEncoder", _FakeEncoder)
-    seen: list[str] = []
-    proc = SpeakerIDProcessor(
-        speakers_db_path=tmp_path / "speakers.db",
-        on_speaker_change=seen.append,
-    )
-    proc._enrolled = {"alice": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)}
-    proc._encoder.next_embedding = np.array([0.97, 0.05, 0.0, 0.0], dtype=np.float32)  # pyright: ignore[reportArgumentType]
-
-    proc._identify_speaker(b"\x00\x00")
-
-    assert seen == ["alice"]
-    assert proc._current_speaker == "alice"
-
-
-def test_threshold_boundary_is_inclusive(monkeypatch, tmp_path):
-    # Construct an incoming embedding whose cosine vs the stored one is exactly
-    # the threshold, to lock the >= (inclusive) comparison.
-    monkeypatch.setattr(speaker_id, "VoiceEncoder", _FakeEncoder)
-    proc = SpeakerIDProcessor(
-        speakers_db_path=tmp_path / "speakers.db",
-        match_threshold=0.75,
-    )
+def test_candidate_threshold_boundary_is_inclusive(monkeypatch, tmp_path):
+    # Single enrolled speaker (margin waived) so this locks the >= threshold edge.
+    _patch_embedder(monkeypatch)
+    proc = SpeakerIDProcessor(speakers_db_path=tmp_path / "speakers.db", match_threshold=0.75)
     stored = np.array([1.0, 0.0], dtype=np.float32)
-    # Unit vector at angle theta where cos(theta) == 0.75.
-    incoming = np.array([0.75, np.sqrt(1 - 0.75**2)], dtype=np.float32)
+    incoming = np.array([0.75, np.sqrt(1 - 0.75**2)], dtype=np.float32)  # cos == 0.75
     proc._enrolled = {"alice": stored}
-    proc._encoder.next_embedding = incoming  # pyright: ignore[reportArgumentType]
-
     assert speaker_id.cosine_similarity(incoming, stored) == pytest.approx(0.75)
+    assert proc._candidate(incoming) == "alice"
 
-    proc._identify_speaker(b"\x00\x00")
 
-    assert proc._current_speaker == "alice"
+# --- single-candidate waiver (Codex P1): one voiceprint has no runner-up -----
+
+
+def test_candidate_single_enrolled_waives_margin(processor):
+    processor._enrolled = {"alice": np.array([1.0, 0.0], dtype=np.float32)}
+    incoming = np.array([0.9, 0.1], dtype=np.float32)  # cosine ~0.994 >= 0.75
+    assert processor._candidate(incoming) == "alice"
+
+
+def test_candidate_single_enrolled_below_threshold_is_unknown(processor):
+    processor._enrolled = {"alice": np.array([1.0, 0.0], dtype=np.float32)}
+    incoming = np.array([0.1, 1.0], dtype=np.float32)  # cosine ~0.1 < 0.75
+    assert processor._candidate(incoming) == "unknown"
+
+
+# --- top1-top2 margin gate --------------------------------------------------
+
+
+def test_candidate_margin_rejects_near_tie(processor):
+    # Two enrolled prints 10° apart; incoming 4° from alice, 6° from bob — both
+    # cosines well above 0.75 but their difference (~0.003) < 0.06 margin.
+    alice = np.array([1.0, 0.0], dtype=np.float32)
+    bob = np.array([np.cos(np.radians(10)), np.sin(np.radians(10))], dtype=np.float32)
+    incoming = np.array([np.cos(np.radians(4)), np.sin(np.radians(4))], dtype=np.float32)
+    processor._enrolled = {"alice": alice, "bob": bob}
+    assert processor._candidate(incoming) == "unknown"
+
+
+def test_candidate_margin_accepts_clear_winner(processor):
+    # alice at 0°, bob at 30°, incoming 1° from alice → margin ~0.12 >= 0.06.
+    alice = np.array([1.0, 0.0], dtype=np.float32)
+    bob = np.array([np.cos(np.radians(30)), np.sin(np.radians(30))], dtype=np.float32)
+    incoming = np.array([np.cos(np.radians(1)), np.sin(np.radians(1))], dtype=np.float32)
+    processor._enrolled = {"alice": alice, "bob": bob}
+    assert processor._candidate(incoming) == "alice"
+
+
+# ---------------------------------------------------------------------------
+# Cross-turn hysteresis: the confirmed speaker switches only after
+# SPEAKER_CHANGE_TURNS consecutive agreeing turns; an unconfirmed turn fails
+# closed to 'unknown' and never inherits the prior confirmed name.
+# ---------------------------------------------------------------------------
+
+
+def test_first_speaker_confirmed_after_change_turns(monkeypatch, tmp_path):
+    changes: list[str] = []
+    proc = _make_proc(monkeypatch, tmp_path, on_speaker_change=changes.append)
+    alice = np.array([1.0, 0.0], dtype=np.float32)
+    proc._enrolled = {"alice": alice}
+
+    # change_turns defaults to 2: turn 1 is unconfirmed (unknown), turn 2 confirms.
+    assert proc._resolve_identity(alice) == "unknown"
+    assert proc.current_speaker == "unknown"
+    assert proc._resolve_identity(alice) == "alice"
+    assert proc.current_speaker == "alice"
+    # Steady state: a continuing turn stays confirmed without re-firing the callback.
+    assert proc._resolve_identity(alice) == "alice"
+    assert changes == ["alice"]
+
+
+def test_single_deviating_turn_does_not_flip_confirmed(monkeypatch, tmp_path):
+    changes: list[str] = []
+    proc = _make_proc(monkeypatch, tmp_path, on_speaker_change=changes.append)
+    alice = np.array([1.0, 0.0], dtype=np.float32)
+    bob = np.array([0.0, 1.0], dtype=np.float32)
+    proc._enrolled = {"alice": alice, "bob": bob}
+
+    # Confirm alice over two turns.
+    proc._resolve_identity(alice)
+    assert proc._resolve_identity(alice) == "alice"
+
+    # A single stray bob turn: snapshots unknown (fail closed) and must NOT flip
+    # the confirmed speaker away from alice.
+    assert proc._resolve_identity(bob) == "unknown"
+    assert proc.current_speaker == "alice"
+
+    # alice resumes and is immediately back in continuity.
+    assert proc._resolve_identity(alice) == "alice"
+    assert changes == ["alice"]  # only the initial confirm fired
+
+
+def test_confirmed_switch_after_consecutive_new_speaker_turns(monkeypatch, tmp_path):
+    changes: list[str] = []
+    proc = _make_proc(monkeypatch, tmp_path, on_speaker_change=changes.append)
+    alice = np.array([1.0, 0.0], dtype=np.float32)
+    bob = np.array([0.0, 1.0], dtype=np.float32)
+    proc._enrolled = {"alice": alice, "bob": bob}
+
+    proc._resolve_identity(alice)
+    proc._resolve_identity(alice)  # alice confirmed
+    assert proc.current_speaker == "alice"
+
+    # Two consecutive bob turns: first unconfirmed (unknown), second confirms.
+    assert proc._resolve_identity(bob) == "unknown"
+    assert proc.current_speaker == "alice"
+    assert proc._resolve_identity(bob) == "bob"
+    assert proc.current_speaker == "bob"
+    assert changes == ["alice", "bob"]
+
+
+# ---------------------------------------------------------------------------
+# Turn-scoped identify: embed ONCE at VAD-stop, from this turn's own audio.
+# ---------------------------------------------------------------------------
+
+
+def test_silence_turn_skips_embed_and_returns_unknown(monkeypatch, tmp_path):
+    """A turn with no voiced audio must not run the encoder and yields unknown."""
+    import asyncio
+
+    fake = _patch_embedder(monkeypatch)
+    calls: list[int] = []
+
+    def counting_embed(audio):
+        calls.append(1)
+        return np.array([1.0, 0.0], dtype=np.float32)
+
+    fake.embed = counting_embed
+    proc = SpeakerIDProcessor(speakers_db_path=tmp_path / "speakers.db")
+    proc._enrolled = {"alice": np.array([1.0, 0.0], dtype=np.float32)}
+
+    result = asyncio.run(proc._identify_turn(b""))
+    assert result == "unknown"
+    assert calls == [], "encoder must not run for a silence (empty) turn"
+    assert proc.current_speaker == "unknown"
+
+
+def test_late_embed_attributes_to_its_own_turn(monkeypatch, tmp_path):
+    """Turn-scoped correlation: each turn's identity comes from that turn's own
+    audio bytes (passed by value at VAD-stop), so a concurrently-dispatched
+    later turn cannot contaminate an earlier one's result."""
+    import asyncio
+
+    alice = np.array([1.0, 0.0], dtype=np.float32)
+    bob = np.array([0.0, 1.0], dtype=np.float32)
+
+    def embed_by_content(audio):
+        # The turn's first sample selects which enrolled speaker it belongs to.
+        return alice if audio[0] > 0 else bob
+
+    fake = _patch_embedder(monkeypatch)
+    fake.embed = embed_by_content
+    proc = SpeakerIDProcessor(
+        speakers_db_path=tmp_path / "speakers.db",
+        change_turns=1,  # confirm on the first turn so snapshot == candidate
+    )
+    proc._enrolled = {"alice": alice, "bob": bob}
+
+    a_bytes = np.array([10000, 0, 0], dtype=np.int16).tobytes()  # → alice
+    b_bytes = np.array([-10000, 0, 0], dtype=np.int16).tobytes()  # → bob
+
+    async def run():
+        # Both turns in flight at once; each must resolve against its own bytes.
+        return await asyncio.gather(
+            proc._identify_turn(a_bytes),
+            proc._identify_turn(b_bytes),
+        )
+
+    assert asyncio.run(run()) == ["alice", "bob"]
+
+
+def test_identify_and_enroll_never_run_encoder_concurrently(monkeypatch, tmp_path):
+    """The shared encoder lock serializes the per-turn identify embed and the
+    enroll embed.  Cancelling a to_thread() torch call would not stop it, so a
+    lock (not cancellation) is what prevents concurrent encoder use."""
+    import asyncio
+    import threading
+    import time
+
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+
+    def instrumented_embed(audio):
+        nonlocal active, max_active
+        with guard:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)  # hold the encoder so any overlap would be observed
+        with guard:
+            active -= 1
+        return np.array([1.0, 0.0], dtype=np.float32)
+
+    db = tmp_path / "speakers.db"
+    fake = _patch_embedder(monkeypatch)
+    fake.embed = instrumented_embed  # the identify path uses this...
+    proc = SpeakerIDProcessor(speakers_db_path=db)
+    proc._enrolled = {"alice": np.array([1.0, 0.0], dtype=np.float32)}
+    # ...and the enroll path uses the same instrumented encoder.
+    proc.arm_capture("bob", embed_fn=instrumented_embed, db_path=db)
+
+    async def run():
+        await asyncio.gather(
+            proc._identify_turn(np.array([10000, 0], dtype=np.int16).tobytes()),
+            proc.finalize_capture("bob", np.zeros(4, dtype=np.float32)),
+        )
+
+    asyncio.run(run())
+    assert max_active == 1, f"encoder ran concurrently (max_active={max_active})"
 
 
 def test_store_speaker_round_trips_through_load_enrolled(tmp_path):
@@ -150,6 +329,85 @@ def test_store_speaker_creates_db_if_missing(tmp_path):
     assert "dan" in load_enrolled(db)
 
 
+# ---------------------------------------------------------------------------
+# Embedder namespacing — a print from one embedder is never matched under
+# another (schema/migration bump, Task 3).
+# ---------------------------------------------------------------------------
+
+
+def test_store_speaker_defaults_embedder_to_resemblyzer(tmp_path):
+    db = tmp_path / "speakers.db"
+    store_speaker(db, "jason", np.array([1.0, 0.0], dtype=np.float32))
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT embedder, dim FROM speakers WHERE name = 'jason'").fetchone()
+    assert row == ("resemblyzer", 2)
+
+
+def test_store_speaker_persists_given_embedder_and_derived_dim(tmp_path):
+    db = tmp_path / "speakers.db"
+    emb = np.zeros(192, dtype=np.float32)
+    store_speaker(db, "jason", emb, embedder="titanet")
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT embedder, dim FROM speakers WHERE name = 'jason'").fetchone()
+    assert row == ("titanet", 192)
+
+
+def test_load_enrolled_filters_by_embedder(tmp_path):
+    db = tmp_path / "speakers.db"
+    store_speaker(db, "alice", np.array([1.0, 0.0], dtype=np.float32), embedder="resemblyzer")
+    store_speaker(db, "bob", np.zeros(192, dtype=np.float32), embedder="titanet")
+
+    resemblyzer_only = load_enrolled(db, embedder="resemblyzer")
+    assert set(resemblyzer_only) == {"alice"}
+
+    titanet_only = load_enrolled(db, embedder="titanet")
+    assert set(titanet_only) == {"bob"}
+
+    everyone = load_enrolled(db)
+    assert set(everyone) == {"alice", "bob"}
+
+
+def test_load_enrolled_legacy_rows_default_to_resemblyzer(tmp_path):
+    """A DB written before the embedder column existed still matches under resemblyzer."""
+    db = tmp_path / "speakers.db"
+    embedding = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    with sqlite3.connect(db) as conn:
+        # Manually create the OLD (pre-Task-3) schema.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS speakers "
+            "(name TEXT PRIMARY KEY, embedding BLOB NOT NULL, "
+            "enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO speakers (name, embedding) VALUES (?, ?)",
+            ("alice", embedding.tobytes()),
+        )
+        conn.commit()
+
+    filtered = load_enrolled(db, embedder="resemblyzer")
+    assert "alice" in filtered
+
+
+def test_speaker_id_never_matches_print_from_different_embedder(monkeypatch, tmp_path):
+    """Migration test: a print labelled for model A is never matched under model B.
+
+    Even a numerically-identical vector must fail closed to 'unknown' — the
+    print belongs to a different embedding space and load_enrolled filters it
+    out before matching ever runs, so this isn't a threshold/near-miss case.
+    """
+    db = tmp_path / "speakers.db"
+    vec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    store_speaker(db, "alice", vec, embedder="titanet")
+
+    _patch_embedder(monkeypatch)  # fake.name == "resemblyzer"
+    proc = SpeakerIDProcessor(speakers_db_path=db)  # default embedder_name="resemblyzer"
+    assert proc._enrolled == {}, "titanet print must not load under a resemblyzer processor"
+
+    # Identical vector — would match if not filtered — but the print was filtered
+    # out at load, so there is nothing to match against → unknown.
+    assert proc._candidate(vec) == "unknown"
+
+
 # Capture state machine tests -----------------------------------------------
 
 _SAMPLE_RATE = 16000
@@ -165,7 +423,8 @@ def _pcm_bytes(seconds: float = 0.1) -> bytes:
 
 def _make_proc(monkeypatch, tmp_path, on_speaker_change=None):
     import larry.speaker_id as sid_mod
-    monkeypatch.setattr(sid_mod, "VoiceEncoder", _FakeEncoder)
+
+    _patch_embedder(monkeypatch, module=sid_mod)
     return SpeakerIDProcessor(
         speakers_db_path=tmp_path / "speakers.db",
         on_speaker_change=on_speaker_change,
@@ -184,7 +443,7 @@ def test_arm_capture_ignored_when_already_armed(monkeypatch, tmp_path):
     proc = _make_proc(monkeypatch, tmp_path)
     emb = np.array([0.9, 0.1], dtype=np.float32)
     proc.arm_capture("jason", embed_fn=lambda audio: emb)
-    proc.arm_capture("dan", embed_fn=lambda audio: emb)   # second call ignored
+    proc.arm_capture("dan", embed_fn=lambda audio: emb)  # second call ignored
     assert proc._capture_name == "jason"
 
 
@@ -231,6 +490,7 @@ def test_unvoiced_audio_not_accumulated(monkeypatch, tmp_path):
 def test_successful_capture_returns_ready_and_finalize_stores(monkeypatch, tmp_path):
     """add_capture_audio returns 'ready'; finalize_capture stores and fires callback."""
     import asyncio
+
     db = tmp_path / "speakers.db"
     fixed_emb = np.array([0.7, 0.3], dtype=np.float32)
     completed: list[str] = []
@@ -266,7 +526,7 @@ def test_successful_capture_returns_ready_and_finalize_stores(monkeypatch, tmp_p
     assert final["status"] == "enrolled"
     assert final["name"] == "jason"
     assert "jason" in load_enrolled(db)
-    assert completed == ["jason"]   # on_speaker_change fired
+    assert completed == ["jason"]  # on_speaker_change fired
     assert proc._capture_state == "idle"
 
 
@@ -277,6 +537,7 @@ def test_abort_when_wall_clock_cap_expires_with_insufficient_voiced(monkeypatch,
     proc = _make_proc(monkeypatch, tmp_path)
     # Patch time.monotonic inside speaker_id so the cap is controllable.
     import larry.speaker_id as sid_mod
+
     fake_time = [0.0]
     monkeypatch.setattr(sid_mod, "_monotonic", lambda: fake_time[0])
 
@@ -291,24 +552,26 @@ def test_abort_when_wall_clock_cap_expires_with_insufficient_voiced(monkeypatch,
     proc.bot_stopped_speaking()
 
     # Advance fake time past cap; add only 2s voiced (< 6s floor).
-    fake_time[0] = 6.0   # past the 5s cap
+    fake_time[0] = 6.0  # past the 5s cap
     result = proc.add_capture_audio(_pcm_bytes(2.0), vad_voiced=True, bot_speaking=False)
 
     assert result is not None
     assert result["status"] == "abort"
-    assert "jason" not in load_enrolled(db)   # nothing written
+    assert "jason" not in load_enrolled(db)  # nothing written
     assert proc._capture_state == "idle"
 
 
 def test_cap_with_floor_met_returns_ready(monkeypatch, tmp_path):
     """FIX B: when cap expires but voiced >= floor, return 'ready' (not stuck)."""
     import asyncio
+
     db = tmp_path / "speakers.db"
     fixed_emb = np.array([0.7, 0.3], dtype=np.float32)
     completed: list[str] = []
 
     proc = _make_proc(monkeypatch, tmp_path, on_speaker_change=completed.append)
     import larry.speaker_id as sid_mod
+
     fake_time = [0.0]
     monkeypatch.setattr(sid_mod, "_monotonic", lambda: fake_time[0])
 
@@ -349,8 +612,6 @@ def test_cap_with_floor_met_returns_ready(monkeypatch, tmp_path):
 # last_seen migration + helpers
 # ---------------------------------------------------------------------------
 
-import sqlite3  # noqa: E402
-
 
 def test_ensure_schema_adds_last_seen_column(tmp_path):
     """_ensure_schema adds last_seen TEXT; calling it twice is idempotent."""
@@ -362,6 +623,35 @@ def test_ensure_schema_adds_last_seen_column(tmp_path):
         assert "last_seen" in cols
         # Second call must not raise.
         speaker_id._ensure_schema(conn)
+
+
+def test_ensure_schema_adds_embedder_and_dim_columns(tmp_path):
+    """_ensure_schema adds embedder TEXT + dim INTEGER; calling it twice is idempotent."""
+    db = tmp_path / "speakers.db"
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(speakers)")}
+        assert {"embedder", "dim"} <= cols
+        speaker_id._ensure_schema(conn)
+
+
+def test_ensure_schema_upgrade_backfills_embedder_and_dim_on_old_rows(tmp_path):
+    """A row written under the pre-Task-3 schema gets embedder/dim defaults, not NULL."""
+    db = tmp_path / "speakers.db"
+    embedding = b"\x00\x00\x80\x3f"  # float32 1.0 as bytes
+    with sqlite3.connect(db) as conn:
+        # Manually create the OLD (pre-embedder-column) schema.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS speakers "
+            "(name TEXT PRIMARY KEY, embedding BLOB NOT NULL, "
+            "enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen TEXT)"
+        )
+        conn.execute("INSERT INTO speakers (name, embedding) VALUES (?, ?)", ("alice", embedding))
+        conn.commit()
+    with sqlite3.connect(db) as conn:
+        speaker_id._ensure_schema(conn)
+        row = conn.execute("SELECT embedder, dim FROM speakers WHERE name = 'alice'").fetchone()
+    assert row == ("resemblyzer", 256)
 
 
 def test_ensure_schema_upgrade_preserves_existing_rows(tmp_path):

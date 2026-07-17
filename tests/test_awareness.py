@@ -104,3 +104,27 @@ def test_recency_phrase_future_timestamp_treated_as_now():
     future = (_NOW + datetime.timedelta(days=1)).isoformat()
     result = awareness.recency_phrase(future, _NOW)
     assert result == "earlier today"
+
+
+# --------------------------------------------------------------------------
+# effective_recency_line: the recency line shown to the LLM must agree with
+# THIS turn's speaker snapshot. On an unconfirmed ('unknown') turn the stored
+# line still names the last confirmed speaker, so it must be suppressed —
+# otherwise the prompt says "You are speaking with Alice" while an unproven
+# voice is talking (Codex P2). Named turns pass the stored line through.
+# --------------------------------------------------------------------------
+
+
+def test_effective_recency_line_suppressed_on_unknown_turn():
+    stored = "You are speaking with Alice. Last with you yesterday."
+    assert awareness.effective_recency_line(stored, "unknown") is None
+
+
+def test_effective_recency_line_passes_through_on_named_turn():
+    stored = "You are speaking with Alice. Last with you yesterday."
+    assert awareness.effective_recency_line(stored, "alice") == stored
+
+
+def test_effective_recency_line_none_stays_none():
+    assert awareness.effective_recency_line(None, "unknown") is None
+    assert awareness.effective_recency_line(None, "bob") is None

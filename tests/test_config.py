@@ -55,7 +55,7 @@ def test_default_llm_without_xai(monkeypatch, required_keys):
     monkeypatch.delenv("LLM_MODEL", raising=False)
     cfg = load_config()
     assert cfg.xai_api_key is None
-    assert cfg.llm_model == "anthropic/claude-sonnet-4-6"
+    assert cfg.llm_model == "anthropic/claude-sonnet-5"
 
 
 def test_default_llm_with_xai(monkeypatch, required_keys):
@@ -148,7 +148,7 @@ def test_elevenlabs_defaults(monkeypatch, required_keys):
     monkeypatch.delenv("ELEVENLABS_MODEL", raising=False)
     cfg = load_config()
     assert cfg.elevenlabs_voice_id == "cPoqAvGWCPfCfyPMwe4z"
-    assert cfg.elevenlabs_model == "eleven_turbo_v2_5"
+    assert cfg.elevenlabs_model == "eleven_flash_v2_5"
 
 
 def test_elevenlabs_overrides(monkeypatch, required_keys):
@@ -239,15 +239,18 @@ def test_valid_config_constructs_without_error(required_keys):
 def test_speaker_id_defaults(required_keys):
     cfg = load_config()
     assert cfg.speaker_match_threshold == 0.75
-    assert cfg.speaker_window_s == 1.0
+    assert cfg.speaker_change_turns == 2
+    assert cfg.speaker_margin == 0.06
 
 
 def test_speaker_id_overrides(monkeypatch, required_keys):
     monkeypatch.setenv("SPEAKER_MATCH_THRESHOLD", "0.62")
-    monkeypatch.setenv("SPEAKER_WINDOW_S", "1.5")
+    monkeypatch.setenv("SPEAKER_CHANGE_TURNS", "3")
+    monkeypatch.setenv("SPEAKER_MARGIN", "0.1")
     cfg = load_config()
     assert cfg.speaker_match_threshold == 0.62
-    assert cfg.speaker_window_s == 1.5
+    assert cfg.speaker_change_turns == 3
+    assert cfg.speaker_margin == 0.1
 
 
 @pytest.mark.parametrize(
@@ -255,7 +258,12 @@ def test_speaker_id_overrides(monkeypatch, required_keys):
     [
         ("SPEAKER_MATCH_THRESHOLD", "1.5", "speaker_match_threshold"),
         ("SPEAKER_MATCH_THRESHOLD", "-0.1", "speaker_match_threshold"),
-        ("SPEAKER_WINDOW_S", "0", "speaker_window_s"),
+        # SPEAKER_CHANGE_TURNS=0 silently disables hysteresis — must be rejected.
+        ("SPEAKER_CHANGE_TURNS", "0", "speaker_change_turns"),
+        ("SPEAKER_CHANGE_TURNS", "-1", "speaker_change_turns"),
+        # An out-of-range margin (would send everyone to unknown) — rejected.
+        ("SPEAKER_MARGIN", "1.5", "speaker_margin"),
+        ("SPEAKER_MARGIN", "-0.1", "speaker_margin"),
     ],
 )
 def test_speaker_id_invalid_raises(monkeypatch, required_keys, env_var, bad_value, field_name):
@@ -263,6 +271,26 @@ def test_speaker_id_invalid_raises(monkeypatch, required_keys, env_var, bad_valu
     with pytest.raises(ValueError) as exc:
         load_config()
     assert field_name in str(exc.value)
+
+
+def test_speaker_embedder_defaults_to_resemblyzer(monkeypatch, required_keys):
+    monkeypatch.delenv("SPEAKER_EMBEDDER", raising=False)
+    cfg = load_config()
+    assert cfg.speaker_embedder == "resemblyzer"
+
+
+def test_speaker_embedder_override_normalized(monkeypatch, required_keys):
+    monkeypatch.setenv("SPEAKER_EMBEDDER", "  RESEMBLYZER  ")
+    cfg = load_config()
+    assert cfg.speaker_embedder == "resemblyzer"
+
+
+def test_speaker_embedder_rejects_unknown_value(monkeypatch, required_keys):
+    monkeypatch.setenv("SPEAKER_EMBEDDER", "titanet")
+    with pytest.raises(ValueError) as exc:
+        load_config()
+    assert "speaker_embedder" in str(exc.value)
+    assert "titanet" in str(exc.value)
 
 
 def test_self_evolution_defaults(monkeypatch, required_keys):
@@ -289,3 +317,36 @@ def test_voice_tools_enabled_overridable(monkeypatch, required_keys):
     monkeypatch.setenv("VOICE_TOOLS_ENABLED", "false")
     cfg = load_config()
     assert cfg.voice_tools_enabled is False
+
+
+# --- Wake word custom path default resolution -------------------------------
+
+
+def test_wake_word_custom_path_defaults_to_committed_model(monkeypatch, required_keys):
+    # No env override: the committed "Hey Larry" model (package-relative, like
+    # personality_path) is selected when present.
+    monkeypatch.delenv("WAKE_WORD_CUSTOM_PATH", raising=False)
+    cfg = load_config()
+    assert cfg.wake_word_custom_path is not None
+    assert cfg.wake_word_custom_path.endswith("wake_models/hey_larry.onnx")
+    from pathlib import Path
+
+    assert Path(cfg.wake_word_custom_path).exists()
+
+
+def test_wake_word_custom_path_env_override_wins(monkeypatch, required_keys):
+    monkeypatch.setenv("WAKE_WORD_CUSTOM_PATH", "/tmp/some-other-model.onnx")
+    cfg = load_config()
+    assert cfg.wake_word_custom_path == "/tmp/some-other-model.onnx"
+
+
+def test_wake_word_custom_path_falls_back_when_committed_model_missing(monkeypatch, required_keys):
+    # Simulate a checkout without the committed .onnx (e.g. before training).
+    import larry.config as config_module
+
+    monkeypatch.delenv("WAKE_WORD_CUSTOM_PATH", raising=False)
+    monkeypatch.setattr(config_module, "_default_wake_word_custom_path", lambda: None)
+    cfg = load_config()
+    assert cfg.wake_word_custom_path is None
+    # hey_jarvis pretrained path is unaffected — it's the wake.py fallback.
+    assert cfg.wake_word_model == "hey_jarvis"

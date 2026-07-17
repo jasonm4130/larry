@@ -11,14 +11,17 @@ Cursed AI character in a motorized Halloween skull on a Raspberry Pi 5; runs on 
 **Pipeline order:**
 ```
 LocalAudioTransport
-  → SpeakerID (Resemblyzer)
+  → SpeakerID (Resemblyzer)     # audio → identity; snapshots the turn's speaker at VAD-stop
   → GroqSTT
-  → Mem0 (short-term memory)
-  → OpenAILLM (via OpenRouter → Claude Sonnet 4.6)
+  → SpeakerTag                  # tags each transcript with the turn's frozen [speaker: name]
+  → Mem0 (short-term memory)    # scoped per-turn to that snapshot; unknown turns get NO Mem0 I/O
+  → OpenAILLM (via OpenRouter → Claude Sonnet 5)
   → ElevenLabsTTS
   → AudioBufferProcessor (tap for jaw sync)
   → transport.output
 ```
+
+**One immutable per-turn identity.** The speaker is identified once at the VAD boundary and that *frozen* value (not a live `current_speaker`) is threaded to the `[speaker: name]` tag, Mem0 retrieval, the Mem0 deferred store, and the conversation log — so none of them cross-attribute a later turn's speaker. `unknown` turns are ephemeral (no Mem0 read/store). This identity path requires **segmented STT** (`STT_PROVIDER=groq`, the default); `STT_PROVIDER=xai` is streaming, logs a loud warning, and disables per-speaker attribution (base single-namespace Mem0). Tag format + parser live in `src/larry/speaker_tag.py`; the tagger is `SpeakerTagProcessor` in `speaker_id.py`; the scoped store is `ScopedMem0MemoryService` in `memory.py`.
 
 **Wake word** ("Hey Larry") gates the pipeline via custom `FrameProcessor` in `wake.py` — OpenWakeWord (Apache-2.0, no API key). Default model `hey_jarvis`. Train a custom "Hey Larry" via the [OpenWakeWord Colab](https://colab.research.google.com/drive/1q1oe2zOyZp7UsB3jJiQ1IFn8z5YfjwEb) and point `WAKE_WORD_CUSTOM_PATH` at the resulting .onnx file.
 
@@ -65,7 +68,7 @@ macOS = dev, Pi 5 = production.
 - **XAI_API_KEY** *(optional, preferred)*: when set, the main chat LLM routes direct to xAI (`grok-4.20-non-reasoning` default — ~600ms TTFT, ~20× cheaper than Claude per May 2026 research). Falls back to OpenRouter if unset.
 - **OPENROUTER_API_KEY**: always required for Mem0 fact extraction (Claude Haiku 4.5). Also serves the main chat LLM if XAI_API_KEY is unset.
 - **GROQ_API_KEY**: Groq Whisper-large-v3-turbo (STT).
-- **ELEVENLABS_API_KEY**: ElevenLabs `eleven_turbo_v2_5` (TTS, voice `cPoqAvGWCPfCfyPMwe4z`).
+- **ELEVENLABS_API_KEY**: ElevenLabs `eleven_flash_v2_5` (TTS, voice `cPoqAvGWCPfCfyPMwe4z`).
 
 Wake word runs locally via OpenWakeWord (Apache-2.0) — no API key required.
 
@@ -73,7 +76,7 @@ Embeddings (Mem0 vector layer) run locally via FastEmbed (BAAI/bge-small-en-v1.5
 
 ## Pipecat-Specific Gotchas
 
-- Default LLM model depends on which provider is active: `grok-4.20-non-reasoning` via `GrokLLMService` when `XAI_API_KEY` is set (preferred path), else `anthropic/claude-sonnet-4-6` via `OpenAILLMService` + OpenRouter. Override with `LLM_MODEL` env var; model name semantics differ by provider (prefixed `x-ai/grok-...` for OpenRouter, plain `grok-4.20-non-reasoning` for direct xAI).
+- Default LLM model depends on which provider is active: `grok-4.20-non-reasoning` via `GrokLLMService` when `XAI_API_KEY` is set (preferred path), else `anthropic/claude-sonnet-5` via `OpenAILLMService` + OpenRouter. Override with `LLM_MODEL` env var; model name semantics differ by provider (prefixed `x-ai/grok-...` for OpenRouter, plain `grok-4.20-non-reasoning` for direct xAI).
 - Proactive utterances (speak outside pipeline flow): `await task.queue_frame(TTSSpeakFrame("..."))`
 - User idle detection: `UserIdleProcessor` from `pipecat.processors.user_idle_processor` (NOT a transport hook).
 - Jaw sync: `AudioBufferProcessor` after TTS, register `@event_handler("on_track_audio_data")`, consume `bot_audio` (not `user_audio`).

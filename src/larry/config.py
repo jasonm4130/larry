@@ -8,6 +8,15 @@ def _default_hardware() -> str:
     return "mock" if sys.platform == "darwin" else "pca9685"
 
 
+def _default_wake_word_custom_path() -> str | None:
+    """Package-relative path to the committed "Hey Larry" model, mirroring
+    personality_path's resolution.  Returns None (falls back to the
+    hey_jarvis pretrained model in wake.py) if the .onnx file isn't present —
+    e.g. a checkout predating training, or one that intentionally omits it."""
+    candidate = Path(__file__).parent / "wake_models" / "hey_larry.onnx"
+    return str(candidate) if candidate.exists() else None
+
+
 @dataclass(frozen=True)
 class Config:
     # API keys
@@ -18,7 +27,7 @@ class Config:
     # Mem0's fact-extraction LLM still uses OpenRouter regardless.
     xai_api_key: str | None
     # Default depends on which provider is active: grok-4.20-non-reasoning for
-    # xAI direct, anthropic/claude-sonnet-4-6 for OpenRouter.  Override via LLM_MODEL.
+    # xAI direct, anthropic/claude-sonnet-5 for OpenRouter.  Override via LLM_MODEL.
     llm_model: str
     # STT provider: "groq" (segmented, per-VAD-turn — default) or "xai" (streaming).
     # xAI streaming STT shares one WebSocket session across turns and carries the
@@ -28,12 +37,15 @@ class Config:
     groq_api_key: str
     elevenlabs_api_key: str
     elevenlabs_voice_id: str
-    elevenlabs_model: str  # default eleven_turbo_v2_5; v3 needs alpha access
+    elevenlabs_model: str  # default eleven_flash_v2_5; v3 needs alpha access
 
     # Hardware
     larry_hardware: str
     wake_word_model: str  # OpenWakeWord pretrained model name (default: hey_jarvis)
-    wake_word_custom_path: str | None  # path to a custom .onnx model, if any
+    # Path to a custom .onnx model. Defaults to the committed wake_models/hey_larry.onnx
+    # when present; override with WAKE_WORD_CUSTOM_PATH, or unset to fall back to
+    # wake_word_model (hey_jarvis) if the committed model is absent.
+    wake_word_custom_path: str | None
 
     # Turn-taking / VAD tuning (see docs/plan: turn-taking robustness)
     stt_mute_cooldown_s: float  # STT stays muted this long after bot stops speaking
@@ -42,9 +54,22 @@ class Config:
     enable_smart_turn: bool  # layer Smart Turn v3 neural end-of-turn on top of VAD
     smart_turn_cpu_count: int  # threads for the local Smart Turn ONNX model
 
-    # Speaker identification (Resemblyzer)
+    # Speaker identification
     speaker_match_threshold: float  # cosine-sim cutoff to accept an enrolled match
-    speaker_window_s: float  # audio window length (s) per identification embed
+    # Hysteresis: switch the confirmed speaker only after this many consecutive
+    # turns identify the same best match (>= 1; default 2 — confirms a switch
+    # quickly while rejecting a single stray identification).
+    speaker_change_turns: int
+    # Minimum top1-top2 cosine margin required to accept a match when >= 2
+    # speakers are enrolled (in [0, 1]; default 0.06 — rejects near-ties without
+    # starving normal matches). Waived when < 2 speakers are enrolled (no runner-up).
+    speaker_margin: float
+    # SpeakerEmbedder impl name (src/larry/speaker_embedder.py). Only "resemblyzer"
+    # is implemented; a future TitaNet/ONNX impl is a deferred follow-up (see Task 3
+    # in docs/superpowers/plans/2026-07-17-identity-and-wake-fixes.md). Voiceprints
+    # are namespaced by embedder name, so changing this requires every speaker to
+    # re-enroll.
+    speaker_embedder: str
 
     # Paths
     data_dir: Path
@@ -121,10 +146,22 @@ class Config:
             "must be in [0, 1]",
         )
         _check(
-            self.speaker_window_s > 0,
-            "speaker_window_s",
-            self.speaker_window_s,
-            "must be > 0",
+            self.speaker_change_turns >= 1,
+            "speaker_change_turns",
+            self.speaker_change_turns,
+            "must be >= 1",
+        )
+        _check(
+            0.0 <= self.speaker_margin <= 1.0,
+            "speaker_margin",
+            self.speaker_margin,
+            "must be in [0, 1]",
+        )
+        _check(
+            self.speaker_embedder in {"resemblyzer"},
+            "speaker_embedder",
+            self.speaker_embedder,
+            "must be one of {'resemblyzer'}",
         )
         _check(
             self.smart_turn_cpu_count >= 1,
@@ -166,9 +203,14 @@ def load_config() -> Config:
 
     xai_api_key = os.environ.get("XAI_API_KEY")
     # Default model depends on active provider — xAI's grok-4.20 non-reasoning
-    # variant is the fast/cheap pick when routing direct, Claude Sonnet 4.6
-    # remains the OpenRouter fallback.
-    default_llm = "grok-4.20-non-reasoning" if xai_api_key else "anthropic/claude-sonnet-4-6"
+    # variant is the fast/cheap pick when routing direct, Claude Sonnet 5
+    # remains the OpenRouter fallback. Both this slug and elevenlabs_model's
+    # default below were only WebSearch-checked, not live-API-verified, when
+    # first set (no keys in the dev sandbox); confirmed resolvable via the
+    # OpenRouter (openrouter.ai/anthropic/claude-sonnet-5) and ElevenLabs
+    # model listings as of 2026-07-18. Re-verify on the next model bump —
+    # LLM_MODEL / ELEVENLABS_MODEL are the escape hatch if either goes stale.
+    default_llm = "grok-4.20-non-reasoning" if xai_api_key else "anthropic/claude-sonnet-5"
 
     return Config(
         openrouter_api_key=_require("OPENROUTER_API_KEY"),
@@ -179,17 +221,20 @@ def load_config() -> Config:
         groq_api_key=_require("GROQ_API_KEY"),
         elevenlabs_api_key=_require("ELEVENLABS_API_KEY"),
         elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "cPoqAvGWCPfCfyPMwe4z"),
-        elevenlabs_model=os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
+        elevenlabs_model=os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5"),
         larry_hardware=larry_hardware,
         wake_word_model=os.environ.get("WAKE_WORD_MODEL", "hey_jarvis"),
-        wake_word_custom_path=os.environ.get("WAKE_WORD_CUSTOM_PATH"),
+        wake_word_custom_path=os.environ.get("WAKE_WORD_CUSTOM_PATH")
+        or _default_wake_word_custom_path(),
         stt_mute_cooldown_s=float(os.environ.get("STT_MUTE_COOLDOWN_S", "0.2")),
         vad_start_secs=float(os.environ.get("VAD_START_SECS", "0.1")),
         wake_sleep_timeout_s=float(os.environ.get("WAKE_SLEEP_TIMEOUT_S", "20")),
         enable_smart_turn=_bool("ENABLE_SMART_TURN", smart_turn_default),
         smart_turn_cpu_count=int(os.environ.get("SMART_TURN_CPU_COUNT", "2")),
         speaker_match_threshold=float(os.environ.get("SPEAKER_MATCH_THRESHOLD", "0.75")),
-        speaker_window_s=float(os.environ.get("SPEAKER_WINDOW_S", "1.0")),
+        speaker_change_turns=int(os.environ.get("SPEAKER_CHANGE_TURNS", "2")),
+        speaker_margin=float(os.environ.get("SPEAKER_MARGIN", "0.06")),
+        speaker_embedder=os.environ.get("SPEAKER_EMBEDDER", "resemblyzer").strip().lower(),
         data_dir=data_dir,
         speakers_db=data_dir / "speakers.db",
         conversations_db=data_dir / "conversations.db",

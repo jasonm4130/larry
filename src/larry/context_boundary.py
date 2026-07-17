@@ -51,11 +51,12 @@ def make_boundary_snapshot_provider(
         if snapshot != standing["value"]:
             before = context.get_messages()
             kept = [m for m in before if isinstance(m, dict) and m.get("role") == "system"]
-            if len(kept) != len(before):
+            dropped = len(before) - len(kept)
+            if dropped:
                 context.set_messages(cast(list[LLMContextMessage], kept))
                 logger.info(
                     f"Context boundary: {standing['value']!r} -> {snapshot!r} — "
-                    f"dropped {len(before) - len(kept)} prior turn message(s)"
+                    f"dropped {dropped} prior turn message(s)"
                 )
             standing["value"] = snapshot
         return snapshot

@@ -289,3 +289,36 @@ def test_voice_tools_enabled_overridable(monkeypatch, required_keys):
     monkeypatch.setenv("VOICE_TOOLS_ENABLED", "false")
     cfg = load_config()
     assert cfg.voice_tools_enabled is False
+
+
+# --- Wake word custom path default resolution -------------------------------
+
+
+def test_wake_word_custom_path_defaults_to_committed_model(monkeypatch, required_keys):
+    # No env override: the committed "Hey Larry" model (package-relative, like
+    # personality_path) is selected when present.
+    monkeypatch.delenv("WAKE_WORD_CUSTOM_PATH", raising=False)
+    cfg = load_config()
+    assert cfg.wake_word_custom_path is not None
+    assert cfg.wake_word_custom_path.endswith("wake_models/hey_larry.onnx")
+    from pathlib import Path
+
+    assert Path(cfg.wake_word_custom_path).exists()
+
+
+def test_wake_word_custom_path_env_override_wins(monkeypatch, required_keys):
+    monkeypatch.setenv("WAKE_WORD_CUSTOM_PATH", "/tmp/some-other-model.onnx")
+    cfg = load_config()
+    assert cfg.wake_word_custom_path == "/tmp/some-other-model.onnx"
+
+
+def test_wake_word_custom_path_falls_back_when_committed_model_missing(monkeypatch, required_keys):
+    # Simulate a checkout without the committed .onnx (e.g. before training).
+    import larry.config as config_module
+
+    monkeypatch.delenv("WAKE_WORD_CUSTOM_PATH", raising=False)
+    monkeypatch.setattr(config_module, "_default_wake_word_custom_path", lambda: None)
+    cfg = load_config()
+    assert cfg.wake_word_custom_path is None
+    # hey_jarvis pretrained path is unaffected — it's the wake.py fallback.
+    assert cfg.wake_word_model == "hey_jarvis"

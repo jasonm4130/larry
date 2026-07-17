@@ -136,6 +136,11 @@ def store_speaker(
     emb = embedding.astype(np.float32)
     with sqlite3.connect(db_path) as conn:
         _ensure_schema(conn)
+        already = conn.execute("SELECT 1 FROM speakers WHERE name = ?", (name,)).fetchone()
+        if already is not None:
+            logger.warning(
+                f"Re-enrolling {name!r} — overwriting the existing voiceprint for that name"
+            )
         conn.execute(
             "INSERT OR REPLACE INTO speakers (name, embedding, embedder, dim) VALUES (?, ?, ?, ?)",
             (name, emb.tobytes(), embedder, int(emb.shape[-1])),
@@ -151,14 +156,16 @@ class SpeakerIDProcessor(FrameProcessor):
         speakers_db_path: Path,
         on_speaker_change: Callable[[str], None] | None = None,
         match_threshold: float = 0.75,
-        window_seconds: float = 1.0,
+        change_turns: int = 2,
+        margin: float = 0.06,
         embedder_name: str = "resemblyzer",
     ) -> None:
         super().__init__()
         self._db_path = speakers_db_path
         self._on_speaker_change = on_speaker_change
         self._match_threshold = match_threshold
-        self._window_bytes = int(SAMPLE_RATE * 2 * window_seconds)  # 16kHz int16 bytes
+        self._change_turns = change_turns
+        self._margin = margin
 
         # Construct the embedder first — its .name selects which voiceprints
         # are even loadable, so a print from a different embedder is never
@@ -167,9 +174,28 @@ class SpeakerIDProcessor(FrameProcessor):
         self._enrolled: dict[str, np.ndarray] = load_enrolled(
             speakers_db_path, embedder=self._encoder.name
         )
-        self._audio_buffer: bytearray = bytearray()
+
+        # Turn-scoped identification: buffer this turn's voiced, bot-silent
+        # audio (VAD-start -> VAD-stop) and embed it ONCE at VAD-stop, so the
+        # embedding is inherently tied to its own turn — no rolling window that
+        # straddles turns, no post-hoc result landing on the wrong turn.
+        self._turn_audio: bytearray = bytearray()
+        self._turn_identify_task: asyncio.Task | None = None
+
+        # _current_speaker is the *confirmed* speaker: it switches only after
+        # hysteresis commits a new one, never on a single stray turn.
         self._current_speaker: str = "unknown"
-        self._identify_task: asyncio.Task | None = None
+        # Hysteresis: how many consecutive turns the same named candidate has
+        # won.  A switch is committed once the streak reaches _change_turns.
+        self._pending_candidate: str = "unknown"
+        self._pending_streak: int = 0
+
+        # Shared across BOTH encoder call sites (the per-turn identify embed and
+        # finalize_capture's enroll embed).  Cancelling an asyncio task that
+        # wraps asyncio.to_thread() does NOT stop the torch call already running
+        # in the worker thread, so a lock — not cancellation — is what keeps the
+        # encoder from being entered concurrently (torch state isn't reentrant).
+        self._encoder_lock = asyncio.Lock()
 
         # Capture state machine — arms on enroll_speaker tool call, accumulates
         # voiced audio post-BotStoppedSpeakingFrame, embeds on threshold.
@@ -183,14 +209,14 @@ class SpeakerIDProcessor(FrameProcessor):
         self._capture_cap_wall_s: float = 20.0
         self._capture_embed_fn: Callable[[np.ndarray], np.ndarray] | None = None
         self._capture_db_path: Path | None = None
-        # VAD / bot-speaking state tracked for capture gating.
+        # VAD / bot-speaking state tracked for capture + turn gating.
         self._vad_voiced: bool = False
         self._bot_speaking_for_capture: bool = False
 
         logger.info(
             f"SpeakerIDProcessor ready: embedder={self._encoder.name!r}, "
             f"{len(self._enrolled)} enrolled speaker(s), "
-            f"threshold={match_threshold}, window={window_seconds}s"
+            f"threshold={match_threshold}, change_turns={change_turns}, margin={margin}"
         )
 
     @property
@@ -201,26 +227,11 @@ class SpeakerIDProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InputAudioRawFrame):
-            self._audio_buffer.extend(frame.audio)
-            if len(self._audio_buffer) >= self._window_bytes:
-                window = bytes(self._audio_buffer[: self._window_bytes])
-                del self._audio_buffer[: self._window_bytes]
-                # Fire-and-forget: Resemblyzer's torch embed is a 100-200ms
-                # CPU stall.  Running it inline blocks the whole pipeline
-                # (STT/LLM/TTS frames queue up behind us).  Skip new windows
-                # while a prior embed is still running — torch state isn't
-                # safe for concurrent calls, and "who is speaking right now"
-                # is fine to sample every couple seconds rather than every
-                # 1s window.
-                # Also skip identification while enrollment is in progress —
-                # both paths call the same torch encoder and it is not
-                # concurrency-safe.  Identifying during enrollment is pointless.
-                if (self._capture_state == "idle") and (
-                    self._identify_task is None or self._identify_task.done()
-                ):
-                    self._identify_task = asyncio.create_task(
-                        asyncio.to_thread(self._identify_speaker, window)
-                    )
+            # Turn-scoped identification: accumulate only this turn's voiced,
+            # bot-silent audio (mirrors the capture gate).  Bot-speaking audio
+            # is TTS echo, not the speaker — never embed it.
+            if self._vad_voiced and not self._bot_speaking_for_capture:
+                self._turn_audio.extend(frame.audio)
             # Feed capture accumulator (if capturing) for every raw frame.
             if self._capture_state == "capturing":
                 result = self.add_capture_audio(
@@ -248,8 +259,26 @@ class SpeakerIDProcessor(FrameProcessor):
             self.bot_stopped_speaking()
             await self.push_frame(frame, direction)
 
-        elif isinstance(frame, (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame)):
-            self._vad_voiced = isinstance(frame, VADUserStartedSpeakingFrame)
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            self._vad_voiced = True
+            self._turn_audio = bytearray()  # start a fresh per-turn buffer
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._vad_voiced = False
+            # Turn boundary: embed THIS turn's own voiced audio once, off the
+            # event loop.  The bytes are snapshotted here (passed by value into
+            # the task), so a late-completing embed still attributes to this
+            # turn, never a later one.  Task 5 awaits this task for the snapshot.
+            turn_bytes = bytes(self._turn_audio)
+            self._turn_audio = bytearray()
+            # Skip identification while enrollment is in progress: the encoder is
+            # busy with the enroll embed, and identifying the enrollment phrase is
+            # pointless.  (_encoder_lock would serialize them safely anyway — this
+            # just avoids the wasted embed and keeps enrollment turns out of the
+            # hysteresis streak.)
+            if self._capture_state == "idle":
+                self._turn_identify_task = asyncio.create_task(self._identify_turn(turn_bytes))
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TranscriptionFrame):
@@ -259,34 +288,97 @@ class SpeakerIDProcessor(FrameProcessor):
         else:
             await self.push_frame(frame, direction)
 
-    def _identify_speaker(self, pcm_window: bytes) -> None:
-        """Embed one window of audio and update _current_speaker."""
-        audio = pcm16_to_float32(pcm_window)
-        embedding = np.asarray(self._encoder.embed(audio))
+    async def _identify_turn(self, pcm_bytes: bytes) -> str:
+        """Embed this turn's own voiced audio once and resolve its speaker.
 
+        Returns the turn's identity: the confirmed speaker when this turn
+        confirms or continues them, else 'unknown' (fail closed — an
+        unconfirmed turn never inherits the previously-confirmed speaker).
+
+        ``pcm_bytes`` is this turn's audio, snapshotted at VAD-stop, so the
+        result attributes to this turn even if the embed finishes late.  The
+        encoder call is serialized with enrollment via ``_encoder_lock``.
+        """
+        if not pcm_bytes:
+            # Silence turn — no voiced audio to embed.  Fail closed, no encoder.
+            return self._resolve_identity(None)
+        audio = pcm16_to_float32(pcm_bytes)
+        async with self._encoder_lock:
+            embedding = np.asarray(await asyncio.to_thread(self._encoder.embed, audio))
+        return self._resolve_identity(embedding)
+
+    def _candidate(self, embedding: np.ndarray) -> str:
+        """The per-turn match decision: best enrolled name, or 'unknown'.
+
+        Accepts the top match only when its cosine score clears
+        ``_match_threshold`` AND (with >= 2 enrolled speakers) its top1-top2
+        margin clears ``_margin``.  With < 2 enrolled speakers there is no
+        runner-up, so the margin is undefined and waived — a fresh install with
+        one voiceprint must still identify that speaker, not reject everyone.
+        """
         if not self._enrolled:
-            return
-
-        best_name, best_score = max(
+            return "unknown"
+        ranked = sorted(
             ((name, cosine_similarity(embedding, emb)) for name, emb in self._enrolled.items()),
             key=lambda x: x[1],
+            reverse=True,
         )
-
-        new_speaker = best_name if best_score >= self._match_threshold else "unknown"
-        # Diagnostic: log every window's best candidate + score, so threshold
-        # tuning is data-driven (we can see near-misses, not just matches).
+        best_name, best_score = ranked[0]
+        if len(ranked) >= 2:
+            margin: float | None = best_score - ranked[1][1]
+            margin_ok = margin >= self._margin
+        else:
+            margin = None
+            margin_ok = True  # single-candidate waiver
+        candidate = best_name if (best_score >= self._match_threshold and margin_ok) else "unknown"
+        # Diagnostic: log every turn's best candidate + score + margin, so
+        # threshold/margin tuning is data-driven (we see near-misses, not just hits).
+        margin_str = "n/a" if margin is None else f"{margin:.3f}"
         logger.info(
-            f"Speaker match: best={best_name!r} score={best_score:.3f} "
-            f"thr={self._match_threshold:.2f} → {new_speaker!r}"
+            f"Turn match: best={best_name!r} score={best_score:.3f} "
+            f"thr={self._match_threshold:.2f} margin={margin_str} "
+            f"(need {self._margin:.3f}) -> {candidate!r}"
         )
-        if new_speaker != self._current_speaker:
+        return candidate
+
+    def _resolve_identity(self, embedding: np.ndarray | None) -> str:
+        """Run this turn's candidate through hysteresis; return the turn identity."""
+        candidate = "unknown" if embedding is None else self._candidate(embedding)
+        return self._apply_hysteresis(candidate)
+
+    def _apply_hysteresis(self, candidate: str) -> str:
+        """Update the consecutive-turn streak and, on confirmation, the speaker.
+
+        The confirmed speaker (``_current_speaker``) switches only after
+        ``_change_turns`` consecutive turns name the same speaker; until then an
+        off-speaker turn snapshots 'unknown' rather than the prior confirmed
+        name.  Returns this turn's identity snapshot.
+        """
+        # Track consecutive identical *named* candidates; an 'unknown' turn (or a
+        # different name) breaks the run so the count is truly "consecutive".
+        if candidate != "unknown" and candidate == self._pending_candidate:
+            self._pending_streak += 1
+        else:
+            self._pending_candidate = candidate
+            self._pending_streak = 1 if candidate != "unknown" else 0
+
+        # Commit a switch once a named candidate has held for enough turns.
+        if (
+            candidate != "unknown"
+            and self._pending_streak >= self._change_turns
+            and candidate != self._current_speaker
+        ):
             logger.info(
-                f"Speaker change: {self._current_speaker!r} → {new_speaker!r} "
-                f"(score={best_score:.3f})"
+                f"Speaker confirmed: {self._current_speaker!r} -> {candidate!r} "
+                f"(after {self._pending_streak} consecutive turn(s))"
             )
-            self._current_speaker = new_speaker
+            self._current_speaker = candidate
             if self._on_speaker_change:
-                self._on_speaker_change(new_speaker)
+                self._on_speaker_change(candidate)
+
+        # Fail closed: snapshot the confirmed speaker only when this turn's own
+        # identification agrees with it; otherwise 'unknown' — never inherit.
+        return self._current_speaker if candidate == self._current_speaker else "unknown"
 
     # ------------------------------------------------------------------
     # Capture state machine
@@ -428,7 +520,10 @@ class SpeakerIDProcessor(FrameProcessor):
             self._capture_state = "idle"
             return {"status": "failed", "name": name, "reason": "embed_fn or db_path missing"}
 
-        embedding = np.asarray(await asyncio.to_thread(embed_fn, audio))
+        # Serialize with the per-turn identify embed via the shared encoder lock
+        # (held across the to_thread await) — the encoder is not concurrency-safe.
+        async with self._encoder_lock:
+            embedding = np.asarray(await asyncio.to_thread(embed_fn, audio))
         store_speaker(db_path, name, embedding, embedder=self._encoder.name)
         # Reload in-memory enrolled set so new speaker is immediately identifiable.
         self._enrolled = load_enrolled(db_path, embedder=self._encoder.name)

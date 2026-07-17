@@ -56,7 +56,14 @@ class Config:
 
     # Speaker identification
     speaker_match_threshold: float  # cosine-sim cutoff to accept an enrolled match
-    speaker_window_s: float  # audio window length (s) per identification embed
+    # Hysteresis: switch the confirmed speaker only after this many consecutive
+    # turns identify the same best match (>= 1; default 2 — confirms a switch
+    # quickly while rejecting a single stray identification).
+    speaker_change_turns: int
+    # Minimum top1-top2 cosine margin required to accept a match when >= 2
+    # speakers are enrolled (in [0, 1]; default 0.06 — rejects near-ties without
+    # starving normal matches). Waived when < 2 speakers are enrolled (no runner-up).
+    speaker_margin: float
     # SpeakerEmbedder impl name (src/larry/speaker_embedder.py). Only "resemblyzer"
     # is implemented; a future TitaNet/ONNX impl is a deferred follow-up (see Task 3
     # in docs/superpowers/plans/2026-07-17-identity-and-wake-fixes.md). Voiceprints
@@ -139,10 +146,16 @@ class Config:
             "must be in [0, 1]",
         )
         _check(
-            self.speaker_window_s > 0,
-            "speaker_window_s",
-            self.speaker_window_s,
-            "must be > 0",
+            self.speaker_change_turns >= 1,
+            "speaker_change_turns",
+            self.speaker_change_turns,
+            "must be >= 1",
+        )
+        _check(
+            0.0 <= self.speaker_margin <= 1.0,
+            "speaker_margin",
+            self.speaker_margin,
+            "must be in [0, 1]",
         )
         _check(
             self.speaker_embedder in {"resemblyzer"},
@@ -214,7 +227,8 @@ def load_config() -> Config:
         enable_smart_turn=_bool("ENABLE_SMART_TURN", smart_turn_default),
         smart_turn_cpu_count=int(os.environ.get("SMART_TURN_CPU_COUNT", "2")),
         speaker_match_threshold=float(os.environ.get("SPEAKER_MATCH_THRESHOLD", "0.75")),
-        speaker_window_s=float(os.environ.get("SPEAKER_WINDOW_S", "1.0")),
+        speaker_change_turns=int(os.environ.get("SPEAKER_CHANGE_TURNS", "2")),
+        speaker_margin=float(os.environ.get("SPEAKER_MARGIN", "0.06")),
         speaker_embedder=os.environ.get("SPEAKER_EMBEDDER", "resemblyzer").strip().lower(),
         data_dir=data_dir,
         speakers_db=data_dir / "speakers.db",

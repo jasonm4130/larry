@@ -239,15 +239,18 @@ def test_valid_config_constructs_without_error(required_keys):
 def test_speaker_id_defaults(required_keys):
     cfg = load_config()
     assert cfg.speaker_match_threshold == 0.75
-    assert cfg.speaker_window_s == 1.0
+    assert cfg.speaker_change_turns == 2
+    assert cfg.speaker_margin == 0.06
 
 
 def test_speaker_id_overrides(monkeypatch, required_keys):
     monkeypatch.setenv("SPEAKER_MATCH_THRESHOLD", "0.62")
-    monkeypatch.setenv("SPEAKER_WINDOW_S", "1.5")
+    monkeypatch.setenv("SPEAKER_CHANGE_TURNS", "3")
+    monkeypatch.setenv("SPEAKER_MARGIN", "0.1")
     cfg = load_config()
     assert cfg.speaker_match_threshold == 0.62
-    assert cfg.speaker_window_s == 1.5
+    assert cfg.speaker_change_turns == 3
+    assert cfg.speaker_margin == 0.1
 
 
 @pytest.mark.parametrize(
@@ -255,7 +258,12 @@ def test_speaker_id_overrides(monkeypatch, required_keys):
     [
         ("SPEAKER_MATCH_THRESHOLD", "1.5", "speaker_match_threshold"),
         ("SPEAKER_MATCH_THRESHOLD", "-0.1", "speaker_match_threshold"),
-        ("SPEAKER_WINDOW_S", "0", "speaker_window_s"),
+        # SPEAKER_CHANGE_TURNS=0 silently disables hysteresis — must be rejected.
+        ("SPEAKER_CHANGE_TURNS", "0", "speaker_change_turns"),
+        ("SPEAKER_CHANGE_TURNS", "-1", "speaker_change_turns"),
+        # An out-of-range margin (would send everyone to unknown) — rejected.
+        ("SPEAKER_MARGIN", "1.5", "speaker_margin"),
+        ("SPEAKER_MARGIN", "-0.1", "speaker_margin"),
     ],
 )
 def test_speaker_id_invalid_raises(monkeypatch, required_keys, env_var, bad_value, field_name):

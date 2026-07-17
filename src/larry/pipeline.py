@@ -360,10 +360,11 @@ async def run() -> None:
 
         speaker_id_module.touch_last_seen(cfg.speakers_db, new_name)
         # Schedule a prompt refresh so the new recency line lands immediately.
-        # _on_speaker_change may be called from _identify_speaker inside
-        # asyncio.to_thread(), which runs in a worker thread with no event loop.
-        # call_soon_threadsafe schedules the refresh onto the main loop safely
-        # from any thread.
+        # _on_speaker_change now fires on the event loop (the turn-scoped identify
+        # resolves there after its off-loop embed, as does enrollment finalize),
+        # so call_soon_threadsafe is belt-and-braces — it schedules the refresh
+        # onto the main loop and stays correct even if a future caller fires this
+        # from another thread.
         _main_loop.call_soon_threadsafe(
             lambda: _main_loop.create_task(_refresh_system_prompt())
         )
@@ -372,7 +373,8 @@ async def run() -> None:
         speakers_db_path=cfg.speakers_db,
         on_speaker_change=_on_speaker_change,
         match_threshold=cfg.speaker_match_threshold,
-        window_seconds=cfg.speaker_window_s,
+        change_turns=cfg.speaker_change_turns,
+        margin=cfg.speaker_margin,
         embedder_name=cfg.speaker_embedder,
     )
 

@@ -1,14 +1,21 @@
 """Task 5 — one immutable per-turn speaker identity, threaded to every consumer.
 
-Covers the snapshot side of Task 5:
+Covers the snapshot side of Task 5, as re-worked to carry each turn's identity
+in-band on an ``IdentitySnapshotFrame`` (emitted by ``SpeakerIDProcessor`` at
+the VAD boundary, consumed by the downstream ``SpeakerTagProcessor``):
+
   * the ``[speaker: …]`` tag format round-trip (speaker_tag.py),
   * ``SpeakerTagProcessor`` prefixing the tag onto a downstream STT
     ``TranscriptionFrame`` and it surviving ``WhisperHallucinationFilter``,
   * the tag landing in the real LLM context user message (regression guard for
     finding #2: an upstream tagger's tag never reached the LLM),
-  * ``SpeakerIDProcessor.take_turn_snapshot`` returning this turn's *frozen*
-    identity, not a live ``current_speaker`` read (Codex P2 / test c),
-  * an unconfirmed new-speaker turn snapshotting ``unknown`` (test e).
+  * the tagger's pending FIFO binding each transcript to its *own* turn's
+    identification, not a live ``current_speaker`` a later turn flipped
+    (Codex P2), and surviving two turns closing before either transcript,
+  * a fully-muted bot-echo turn (VAD-stop with no transcript) emitting NO
+    marker, so it can never desync attribution for later turns — the Critical
+    the in-band redesign closes,
+  * an unconfirmed new-speaker turn snapshotting ``unknown`` (never inherited).
 
 Self-contained: the SpeakerEmbedder is monkeypatched so no torch model loads.
 """
@@ -20,11 +27,14 @@ from typing import Any
 import numpy as np
 from pipecat.frames.frames import (
     Frame,
+    InputAudioRawFrame,
     StartFrame,
+    STTMuteFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -32,7 +42,7 @@ from pipecat.tests.utils import run_test
 
 import larry.speaker_id as speaker_id
 from larry.processors import WhisperHallucinationFilter
-from larry.speaker_id import SpeakerIDProcessor, SpeakerTagProcessor
+from larry.speaker_id import IdentitySnapshotFrame, SpeakerIDProcessor, SpeakerTagProcessor
 from larry.speaker_tag import format_speaker_tag, parse_speaker_tag
 
 # --------------------------------------------------------------------------
@@ -86,15 +96,24 @@ def _transcription(text: str) -> TranscriptionFrame:
     return TranscriptionFrame(text=text, user_id="u", timestamp="2026-07-17T00:00:00Z")
 
 
+def _resolved(value: str) -> asyncio.Future[str]:
+    """A pre-resolved future — the snapshot an IdentitySnapshotFrame carries for
+    a turn we already know the identity of (must be built inside a running loop)."""
+    fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    fut.set_result(value)
+    return fut
+
+
+def _identity(value: str) -> IdentitySnapshotFrame:
+    return IdentitySnapshotFrame(snapshot=_resolved(value))
+
+
 def _transcriptions(sink: _Sink) -> list[str]:
     return [f.text for f in sink.received if isinstance(f, TranscriptionFrame)]
 
 
-def _fixed_provider(value: str) -> Callable[[], Coroutine[Any, Any, str]]:
-    async def provider() -> str:
-        return value
-
-    return provider
+def _passthrough(snapshot: str) -> str:
+    return snapshot
 
 
 # --------------------------------------------------------------------------
@@ -104,12 +123,14 @@ def _fixed_provider(value: str) -> Callable[[], Coroutine[Any, Any, str]]:
 
 def test_tagger_prefixes_snapshot_onto_downstream_transcript():
     async def body():
-        tagger = SpeakerTagProcessor(_fixed_provider("alice"), enable_direct_mode=True)
+        tagger = SpeakerTagProcessor(_passthrough, enable_direct_mode=True)
         filt = WhisperHallucinationFilter(enable_direct_mode=True)
         sink = _Sink()
         await _link(tagger, filt, sink)
 
-        # STT emits the transcript *downstream* of the tagger (the bug in
+        # The turn's identity arrives in-band, ahead of its transcript...
+        await tagger.process_frame(_identity("alice"), FrameDirection.DOWNSTREAM)
+        # ...then STT emits the transcript *downstream* of the tagger (the bug in
         # finding #2 was the tagger sitting upstream of STT and never seeing it).
         await tagger.process_frame(_transcription("hello larry"), FrameDirection.DOWNSTREAM)
         await asyncio.sleep(0)
@@ -120,16 +141,40 @@ def test_tagger_prefixes_snapshot_onto_downstream_transcript():
     _run(body)
 
 
-def test_tagger_tags_unknown_when_snapshot_unknown():
+def test_tagger_tags_unknown_when_no_pending_snapshot_fails_closed():
     async def body():
-        tagger = SpeakerTagProcessor(_fixed_provider("unknown"), enable_direct_mode=True)
+        tagger = SpeakerTagProcessor(_passthrough, enable_direct_mode=True)
         sink = _Sink()
         await _link(tagger, sink)
 
+        # No IdentitySnapshotFrame arrived for this transcript (e.g. its turn was
+        # never identified) — the tagger must fail closed to 'unknown', never
+        # inherit a prior turn's name.
         await tagger.process_frame(_transcription("who are you"), FrameDirection.DOWNSTREAM)
         await asyncio.sleep(0)
 
         assert _transcriptions(sink) == ["[speaker: unknown] who are you"]
+
+    _run(body)
+
+
+def test_tagger_pops_pending_snapshots_in_fifo_order():
+    """Two turns close (two IdentitySnapshotFrames arrive) before either
+    transcript does — the tagger must bind each transcript to its OWN turn's
+    identity in order, not to whichever marker arrived last (Codex P2)."""
+
+    async def body():
+        tagger = SpeakerTagProcessor(_passthrough, enable_direct_mode=True)
+        sink = _Sink()
+        await _link(tagger, sink)
+
+        await tagger.process_frame(_identity("alice"), FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(_identity("bob"), FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(_transcription("first"), FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(_transcription("second"), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0)
+
+        assert _transcriptions(sink) == ["[speaker: alice] first", "[speaker: bob] second"]
 
     _run(body)
 
@@ -158,7 +203,7 @@ def test_tagged_transcription_lands_in_llm_context_user_message():
 
 
 # --------------------------------------------------------------------------
-# (c) take_turn_snapshot returns the frozen per-turn identity, not a live read
+# (c) end-to-end: SpeakerIDProcessor -> SpeakerTagProcessor via the in-band marker
 # --------------------------------------------------------------------------
 
 
@@ -170,36 +215,136 @@ class _FakeEmbedder:
         return self.next_embedding
 
 
-def _make_proc(monkeypatch, tmp_path, **kwargs) -> SpeakerIDProcessor:
-    monkeypatch.setattr(speaker_id, "get_speaker_embedder", lambda name: _FakeEmbedder())
-    return SpeakerIDProcessor(speakers_db_path=tmp_path / "speakers.db", **kwargs)
+def _by_content_embedder(monkeypatch, alice: np.ndarray, bob: np.ndarray) -> None:
+    fake = _FakeEmbedder()
+    # First PCM sample sign selects the speaker, so a turn's audio bytes decide
+    # its identity — lets a test thread distinct speakers through the real embed.
+    fake.embed = lambda audio_f32_16k: alice if audio_f32_16k[0] > 0 else bob
+    monkeypatch.setattr(speaker_id, "get_speaker_embedder", lambda name: fake)
 
 
-def test_take_turn_snapshot_uses_frozen_task_not_live_current_speaker(monkeypatch, tmp_path):
+def _audio(sample: int) -> InputAudioRawFrame:
+    return InputAudioRawFrame(
+        audio=np.array([sample, 0], dtype=np.int16).tobytes(), sample_rate=16000, num_channels=1
+    )
+
+
+_ALICE_SAMPLE = 10000  # -> alice
+_BOB_SAMPLE = -10000  # -> bob
+
+
+def _real_turn(sample: int) -> list[Frame]:
+    """The frame sequence for a normal (voiced, un-muted) user turn."""
+    return [VADUserStartedSpeakingFrame(), _audio(sample), VADUserStoppedSpeakingFrame()]
+
+
+def _muted_echo_turn(sample: int) -> list[Frame]:
+    """A bot-echo turn: STT muted for its whole duration, so it yields no
+    transcript and must yield no IdentitySnapshotFrame."""
+    return [
+        STTMuteFrame(mute=True),
+        VADUserStartedSpeakingFrame(),
+        _audio(sample),
+        VADUserStoppedSpeakingFrame(),
+        STTMuteFrame(mute=False),
+    ]
+
+
+async def _drive(proc: SpeakerIDProcessor, frames: list[Frame]) -> list[str]:
+    """Run *frames* through proc -> tagger and return the tagged transcripts."""
+    tagger = SpeakerTagProcessor(_passthrough)
+    pipeline = Pipeline([proc, tagger])
+    down, _ = await run_test(
+        pipeline,
+        frames_to_send=frames,
+        expected_down_frames=None,
+        send_end_frame=True,
+    )
+    return [f.text for f in down if isinstance(f, TranscriptionFrame)]
+
+
+def _make_id_proc(monkeypatch, tmp_path, alice, bob, **kwargs) -> SpeakerIDProcessor:
+    _by_content_embedder(monkeypatch, alice, bob)
+    proc = SpeakerIDProcessor(speakers_db_path=tmp_path / "speakers.db", change_turns=1, **kwargs)
+    proc._enrolled = {"alice": alice, "bob": bob}
+    return proc
+
+
+def test_each_transcript_bound_to_its_own_turn(monkeypatch, tmp_path):
+    """Two real turns (alice then bob): each transcript is tagged with its own
+    turn's identity, threaded end-to-end through the in-band marker."""
+
     async def body():
-        proc = _make_proc(monkeypatch, tmp_path)
+        alice = np.array([1.0, 0.0], dtype=np.float32)
+        bob = np.array([0.0, 1.0], dtype=np.float32)
+        proc = _make_id_proc(monkeypatch, tmp_path, alice, bob)
 
-        async def _resolve(value: str) -> str:
-            return value
-
-        # This turn's own identification resolved to alice.
-        proc._turn_snapshot_queue.append(asyncio.create_task(_resolve("alice")))
-        # ...but a *later* turn has since flipped the confirmed speaker to bob.
-        proc._current_speaker = "bob"
-
-        # The snapshot for this (already-closed) turn must be alice — read from
-        # the frozen per-turn task, NOT from the now-flipped current_speaker.
-        assert await proc.take_turn_snapshot() == "alice"
+        tagged = await _drive(
+            proc,
+            [
+                *_real_turn(_ALICE_SAMPLE),
+                _transcription("hi it's alice"),
+                *_real_turn(_BOB_SAMPLE),
+                _transcription("bob here"),
+            ],
+        )
+        assert tagged == ["[speaker: alice] hi it's alice", "[speaker: bob] bob here"]
 
     asyncio.run(body())
 
 
-def test_take_turn_snapshot_no_task_fails_closed_to_unknown(monkeypatch, tmp_path):
+def test_racing_vad_stops_preserve_turn_order(monkeypatch, tmp_path):
+    """Both turns close (two markers emitted) before either transcript arrives —
+    order, not recency, must bind each transcript to its turn (Codex P2)."""
+
     async def body():
-        proc = _make_proc(monkeypatch, tmp_path)
-        proc._current_speaker = "alice"  # a confirmed speaker is standing...
-        # ...but this transcript had no turn task (queue empty).
-        assert await proc.take_turn_snapshot() == "unknown"  # never inherit
+        alice = np.array([1.0, 0.0], dtype=np.float32)
+        bob = np.array([0.0, 1.0], dtype=np.float32)
+        proc = _make_id_proc(monkeypatch, tmp_path, alice, bob)
+
+        tagged = await _drive(
+            proc,
+            [
+                *_real_turn(_ALICE_SAMPLE),
+                *_real_turn(_BOB_SAMPLE),
+                _transcription("first"),
+                _transcription("second"),
+            ],
+        )
+        assert tagged == ["[speaker: alice] first", "[speaker: bob] second"]
+
+    asyncio.run(body())
+
+
+def test_muted_echo_turn_does_not_desync_attribution(monkeypatch, tmp_path):
+    """Regression (Critical): a fully-muted bot-echo turn produces a VAD-stop but
+    no transcript. If it emitted an IdentitySnapshotFrame, that orphan would sit
+    in the tagger's pending FIFO and every later turn's transcript would pop the
+    wrong (previous) turn's identity — permanent per-session mis-attribution,
+    the exact cross-speaker bug this branch exists to prevent. The mute-gated
+    marker emission means the echo turn emits nothing, so bob's turn after it is
+    still tagged bob, not alice."""
+
+    async def body():
+        alice = np.array([1.0, 0.0], dtype=np.float32)
+        bob = np.array([0.0, 1.0], dtype=np.float32)
+        proc = _make_id_proc(monkeypatch, tmp_path, alice, bob)
+
+        tagged = await _drive(
+            proc,
+            [
+                *_real_turn(_ALICE_SAMPLE),
+                _transcription("alice speaking"),
+                # Bot echo while muted -> no transcript, no marker. Its audio is
+                # given a DIFFERENT identity (alice) than the next real speaker
+                # (bob) so that an orphan marker, if wrongly emitted, would visibly
+                # mis-tag bob's turn as alice rather than coincidentally matching.
+                *_muted_echo_turn(_ALICE_SAMPLE),
+                *_real_turn(_BOB_SAMPLE),
+                _transcription("now bob"),
+            ],
+        )
+        assert tagged == ["[speaker: alice] alice speaking", "[speaker: bob] now bob"]
 
     asyncio.run(body())
 
@@ -209,71 +354,16 @@ def test_take_turn_snapshot_no_task_fails_closed_to_unknown(monkeypatch, tmp_pat
 # --------------------------------------------------------------------------
 
 
-def test_take_turn_snapshot_fifo_survives_racing_vad_stops(monkeypatch, tmp_path):
-    """Regression (Codex P2): SpeakerIDProcessor sits upstream of STT and can
-    race ahead of it, so a second VAD-stop can queue turn N+1's identify task
-    before turn N's transcript ever reaches the tagger. The old single-slot
-    design (``self._turn_identify_task = task``) let turn N+1 overwrite turn
-    N's result the instant its task was created, regardless of when (or
-    whether) anyone had read turn N's snapshot yet — mis-attributing turn N's
-    tag to turn N+1's speaker. The FIFO queue must return each turn's own
-    result in turn order, independent of when the next turn's task is queued.
-    """
-
-    async def body():
-        alice = np.array([1.0, 0.0], dtype=np.float32)
-        bob = np.array([0.0, 1.0], dtype=np.float32)
-
-        def embed_by_content(audio_f32_16k):
-            return alice if audio_f32_16k[0] > 0 else bob
-
-        fake = _FakeEmbedder()
-        fake.embed = embed_by_content
-        monkeypatch.setattr(speaker_id, "get_speaker_embedder", lambda name: fake)
-        # change_turns=1 so a single turn confirms immediately -- isolates the
-        # queue-ordering fix from hysteresis smoothing.
-        proc = SpeakerIDProcessor(speakers_db_path=tmp_path / "speakers.db", change_turns=1)
-        proc._enrolled = {"alice": alice, "bob": bob}
-
-        a_bytes = np.array([10000, 0], dtype=np.int16).tobytes()  # -> alice
-        b_bytes = np.array([-10000, 0], dtype=np.int16).tobytes()  # -> bob
-
-        # Turn N (alice) closes: its identify task is queued.
-        await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-        proc._turn_audio = bytearray(a_bytes)
-        await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-
-        # Turn N+1 (bob) races ahead of STT and closes -- its own task is
-        # queued -- before anything has read turn N's snapshot.
-        await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-        proc._turn_audio = bytearray(b_bytes)
-        await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-
-        # Turn N's transcript finally arrives at the tagger: must get turn
-        # N's own identity (alice), never turn N+1's (bob).
-        assert await proc.take_turn_snapshot() == "alice"
-        # Turn N+1's transcript arrives next: gets its own identity.
-        assert await proc.take_turn_snapshot() == "bob"
-
-    asyncio.run(body())
-
-
 def test_unconfirmed_new_speaker_turn_snapshots_unknown(monkeypatch, tmp_path):
     async def body():
         alice = np.array([1.0, 0.0], dtype=np.float32)
         bob = np.array([0.0, 1.0], dtype=np.float32)
-
-        def embed_by_content(audio_f32_16k):
-            return alice if audio_f32_16k[0] > 0 else bob
-
-        fake = _FakeEmbedder()
-        fake.embed = embed_by_content
-        monkeypatch.setattr(speaker_id, "get_speaker_embedder", lambda name: fake)
+        _by_content_embedder(monkeypatch, alice, bob)
         proc = SpeakerIDProcessor(speakers_db_path=tmp_path / "speakers.db")  # change_turns=2
         proc._enrolled = {"alice": alice, "bob": bob}
 
-        a_bytes = np.array([10000, 0], dtype=np.int16).tobytes()  # → alice
-        b_bytes = np.array([-10000, 0], dtype=np.int16).tobytes()  # → bob
+        a_bytes = np.array([10000, 0], dtype=np.int16).tobytes()  # -> alice
+        b_bytes = np.array([-10000, 0], dtype=np.int16).tobytes()  # -> bob
 
         # Confirm alice over two turns.
         await proc._identify_turn(a_bytes)
@@ -289,30 +379,23 @@ def test_unconfirmed_new_speaker_turn_snapshots_unknown(monkeypatch, tmp_path):
     asyncio.run(body())
 
 
-def test_tagger_tags_each_frame_independently_after_flip():
+def test_tagger_tags_each_frame_independently():
     """A late flip cannot re-attribute an already-closed turn: frame A stays
-    tagged with its own snapshot even after the provider starts returning bob."""
+    tagged with its own snapshot even after a later turn's marker arrives."""
 
     async def body():
-        current = {"value": "alice"}
-
-        async def provider() -> str:
-            return current["value"]
-
-        tagger = SpeakerTagProcessor(provider, enable_direct_mode=True)
+        tagger = SpeakerTagProcessor(_passthrough, enable_direct_mode=True)
         sink = _Sink()
         await _link(tagger, sink)
 
-        frame_a = _transcription("first")
-        await tagger.process_frame(frame_a, FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(_identity("alice"), FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(_transcription("first"), FrameDirection.DOWNSTREAM)
         await asyncio.sleep(0)
 
-        current["value"] = "bob"  # a later turn flips the identity
-        frame_b = _transcription("second")
-        await tagger.process_frame(frame_b, FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(_identity("bob"), FrameDirection.DOWNSTREAM)
+        await tagger.process_frame(_transcription("second"), FrameDirection.DOWNSTREAM)
         await asyncio.sleep(0)
 
-        # Frame A keeps alice (already closed); only frame B gets bob.
         assert _transcriptions(sink) == ["[speaker: alice] first", "[speaker: bob] second"]
 
     _run(body)

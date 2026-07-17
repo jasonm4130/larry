@@ -8,6 +8,7 @@ import asyncio
 import sqlite3
 from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic as _monotonic
 
@@ -18,6 +19,8 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     Frame,
     InputAudioRawFrame,
+    STTMuteFrame,
+    SystemFrame,
     TranscriptionFrame,
     TTSSpeakFrame,
     VADUserStartedSpeakingFrame,
@@ -35,6 +38,50 @@ from larry.voice_enroll import SAMPLE_RATE
 # safety ceiling, not the expected wait. ponytail: fixed 3s ceiling; if real
 # embeds ever approach it, tie it to the encoder latency budget instead.
 _SNAPSHOT_AWAIT_TIMEOUT_S = 3.0
+
+
+@dataclass
+class IdentitySnapshotFrame(SystemFrame):
+    """In-band carrier of one turn's frozen speaker identity.
+
+    ``SpeakerIDProcessor`` emits this at the VAD turn boundary and the
+    downstream ``SpeakerTagProcessor`` consumes it, so a turn's identity travels
+    *with* the turn rather than being read off a shared mutable attribute a
+    later turn could have already flipped (Codex P2).
+
+    It is a ``SystemFrame`` — like ``VADUserStoppedSpeakingFrame`` — so it is
+    processed inline in push order and reaches the tagger *ahead* of the turn's
+    own ``TranscriptionFrame`` (a queued ``DataFrame``). A plain data frame
+    would sit in the queue and arrive only after STT had already emitted the
+    transcript, too late to tag it.
+
+    ``snapshot`` is an awaitable resolving to this turn's identity: an
+    ``asyncio.Task`` from the turn-scoped embed, or a pre-resolved future for a
+    turn we deliberately do not identify (e.g. an enrollment-capture turn).
+    """
+
+    snapshot: "Awaitable[str] | None" = None
+
+
+async def _resolve_turn_snapshot(pending: "Awaitable[str] | None") -> str:
+    """Await a pending per-turn identity, bounded and fail closed to 'unknown'.
+
+    Fails closed if there is nothing pending, if the embed overruns
+    ``_SNAPSHOT_AWAIT_TIMEOUT_S``, or if it errored — an unattributed turn is
+    safe (Larry has a new-voice register); a wrong name is not. The awaitable is
+    ``shield``ed so a wait-timeout here never cancels it: it keeps running to
+    update the hysteresis streak for subsequent turns.
+    """
+    if pending is None:
+        return "unknown"
+    try:
+        return await asyncio.wait_for(asyncio.shield(pending), _SNAPSHOT_AWAIT_TIMEOUT_S)
+    except (TimeoutError, asyncio.CancelledError):
+        logger.warning("Turn snapshot timed out waiting on embed — failing closed to unknown")
+        return "unknown"
+    except Exception:
+        logger.warning("Turn snapshot embed failed — failing closed to unknown", exc_info=True)
+        return "unknown"
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -168,6 +215,7 @@ class SpeakerIDProcessor(FrameProcessor):
         change_turns: int = 2,
         margin: float = 0.06,
         embedder_name: str = "resemblyzer",
+        identify_enabled: bool = True,
     ) -> None:
         super().__init__()
         self._db_path = speakers_db_path
@@ -175,6 +223,12 @@ class SpeakerIDProcessor(FrameProcessor):
         self._match_threshold = match_threshold
         self._change_turns = change_turns
         self._margin = margin
+        # Per-turn identification + IdentitySnapshotFrame emission are only
+        # meaningful on the segmented-STT path, where each transcript is bounded
+        # to its own turn. On the xAI streaming path there is no downstream
+        # tagger to consume the marker, so emitting one (and running the embed)
+        # would burn CPU and grow no-one's queue — disable it there.
+        self._identify_enabled = identify_enabled
 
         # Construct the embedder first — its .name selects which voiceprints
         # are even loadable, so a print from a different embedder is never
@@ -189,18 +243,19 @@ class SpeakerIDProcessor(FrameProcessor):
         # embedding is inherently tied to its own turn — no rolling window that
         # straddles turns, no post-hoc result landing on the wrong turn.
         self._turn_audio: bytearray = bytearray()
-        # FIFO of pending per-turn identity results (a Task from the embed, or a
-        # resolved Future for turns we don't identify) — one entry appended per
-        # VADUserStoppedSpeakingFrame, oldest-first. take_turn_snapshot pops the
-        # head, not a shared "latest" slot: SpeakerIDProcessor sits upstream of
-        # STT and can race ahead of it, so a second VAD-stop can arrive (and, in
-        # a single-slot design, overwrite the result) before the first turn's
-        # TranscriptionFrame reaches the downstream tagger. STT preserves turn
-        # order, so matching queue-order to transcript-order (rather than
-        # reading whatever is "current" when the transcript shows up) is what
-        # keeps a turn's tag bound to its own identification, never a
-        # since-overwritten one (Codex P2).
-        self._turn_snapshot_queue: deque[asyncio.Future[str]] = deque()
+        # Whether STT is currently muted (bot speaking + cool-down trail),
+        # tracked from the STTMuteFrame that STTMuteOnBotSpeech emits and that
+        # flows through here on its way to the STT service. Gates marker
+        # emission: a fully-muted turn (acoustic bot-echo) is dropped by the STT
+        # and yields no transcript, so it must yield no IdentitySnapshotFrame
+        # either — else the tagger's pending FIFO would gain an entry no
+        # transcript ever pops, permanently mis-aligning every later turn.
+        self._stt_muted: bool = False
+        # True once this turn accumulates voiced audio while un-muted — i.e.
+        # audio the STT will actually transcribe. A turn that never sees an
+        # un-muted voiced frame (pure echo during bot speech/cool-down) emits no
+        # marker. Reset at each VAD-start.
+        self._turn_saw_unmuted: bool = False
 
         # _current_speaker is the *confirmed* speaker: it switches only after
         # hysteresis commits a new one, never on a single stray turn.
@@ -243,44 +298,27 @@ class SpeakerIDProcessor(FrameProcessor):
     def current_speaker(self) -> str:
         return self._current_speaker
 
-    async def take_turn_snapshot(self) -> str:
-        """Return the frozen identity of the *oldest still-pending* turn.
-
-        The downstream SpeakerTagProcessor calls this when a TranscriptionFrame
-        arrives, so the tag binds to *that* turn's own identification (awaited,
-        bounded) — never a live ``current_speaker`` read, which a later turn's
-        identify could already have flipped to a different speaker (Codex P2).
-        Popped FIFO from ``_turn_snapshot_queue`` rather than read off a shared
-        "latest" attribute, so a second VAD-stop racing ahead of STT can never
-        overwrite the result this call is waiting on.
-
-        Fails closed to ``'unknown'`` if the queue is empty, if the embed
-        overruns ``_SNAPSHOT_AWAIT_TIMEOUT_S``, or if it errored — an unattributed
-        turn is safe (Larry has a new-voice register); a wrong name is not. The
-        embed is ``shield``ed so a wait-timeout here never cancels it: it keeps
-        running to update the hysteresis streak for subsequent turns.
-        """
-        if not self._turn_snapshot_queue:
-            return "unknown"
-        task = self._turn_snapshot_queue.popleft()
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), _SNAPSHOT_AWAIT_TIMEOUT_S)
-        except (TimeoutError, asyncio.CancelledError):
-            logger.warning("Turn snapshot timed out waiting on embed — failing closed to unknown")
-            return "unknown"
-        except Exception:
-            logger.warning("Turn snapshot embed failed — failing closed to unknown", exc_info=True)
-            return "unknown"
-
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, InputAudioRawFrame):
+        if isinstance(frame, STTMuteFrame):
+            # STTMuteOnBotSpeech emits this upstream of us; track it (and forward
+            # it, since the STT downstream is the real consumer) so we can gate
+            # marker emission on whether this turn's audio will be transcribed.
+            self._stt_muted = frame.mute
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, InputAudioRawFrame):
             # Turn-scoped identification: accumulate only this turn's voiced,
             # bot-silent audio (mirrors the capture gate).  Bot-speaking audio
             # is TTS echo, not the speaker — never embed it.
             if self._vad_voiced and not self._bot_speaking_for_capture:
                 self._turn_audio.extend(frame.audio)
+            # This turn saw audio the STT will transcribe iff it was voiced while
+            # un-muted — the same condition MutedGroqSTTService buffers under, so
+            # marker emission stays 1:1 with transcript emission (no orphans).
+            if self._vad_voiced and not self._stt_muted:
+                self._turn_saw_unmuted = True
             # Feed capture accumulator (if capturing) for every raw frame.
             if self._capture_state == "capturing":
                 result = self.add_capture_audio(
@@ -311,31 +349,36 @@ class SpeakerIDProcessor(FrameProcessor):
         elif isinstance(frame, VADUserStartedSpeakingFrame):
             self._vad_voiced = True
             self._turn_audio = bytearray()  # start a fresh per-turn buffer
+            self._turn_saw_unmuted = False  # ...and a fresh transcribable flag
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             self._vad_voiced = False
-            # Turn boundary: embed THIS turn's own voiced audio once, off the
-            # event loop.  The bytes are snapshotted here (passed by value into
-            # the task), so a late-completing embed still attributes to this
-            # turn, never a later one.  Task 5 awaits this task for the snapshot.
             turn_bytes = bytes(self._turn_audio)
             self._turn_audio = bytearray()
-            # Skip identification while enrollment is in progress: the encoder is
-            # busy with the enroll embed, and identifying the enrollment phrase is
-            # pointless.  (_encoder_lock would serialize them safely anyway — this
-            # just avoids the wasted embed and keeps enrollment turns out of the
-            # hysteresis streak.)  Either way, enqueue THIS turn's result (FIFO,
-            # never overwriting a still-pending prior turn) so take_turn_snapshot
-            # never hands the downstream tagger a stale or later turn's identity:
-            # an enrollment turn resolves to 'unknown' rather than inheriting the
-            # last confirmed speaker.
-            if self._capture_state == "idle":
-                self._turn_snapshot_queue.append(asyncio.create_task(self._identify_turn(turn_bytes)))
-            else:
-                unknown: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-                unknown.set_result("unknown")
-                self._turn_snapshot_queue.append(unknown)
+            saw_unmuted = self._turn_saw_unmuted
+            self._turn_saw_unmuted = False
+            # Emit this turn's identity in-band ONLY for turns the STT will
+            # transcribe: identification enabled (segmented-STT path) AND the
+            # turn had voiced, un-muted audio. A fully-muted bot-echo turn yields
+            # no transcript, so emitting a marker for it would leave an orphan
+            # the tagger never consumes — permanently desyncing every later turn
+            # (the FIFO-drift bug this guard closes). The marker is a SystemFrame
+            # pushed BEFORE the VAD-stop so it reaches the tagger ahead of the
+            # transcript. The embedded bytes are snapshotted here (by value), so
+            # a late-completing embed still attributes to this turn, never a
+            # later one. Enrollment-capture turns are voiced+un-muted (so they
+            # ARE transcribed and DO need a marker) but resolve to 'unknown'
+            # rather than inheriting the last confirmed speaker.
+            if self._identify_enabled and saw_unmuted:
+                snapshot: Awaitable[str]
+                if self._capture_state == "idle":
+                    snapshot = asyncio.create_task(self._identify_turn(turn_bytes))
+                else:
+                    fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                    fut.set_result("unknown")
+                    snapshot = fut
+                await self.push_frame(IdentitySnapshotFrame(snapshot=snapshot), direction)
             await self.push_frame(frame, direction)
 
         else:
@@ -598,22 +641,40 @@ class SpeakerTagProcessor(FrameProcessor):
     ``TranscriptionFrame`` STT emits (finding #2: that is exactly why the old
     upstream tag never reached the LLM).
 
-    The snapshot comes from ``snapshot_provider`` (in production,
-    ``SpeakerIDProcessor.take_turn_snapshot``), which awaits *this* turn's own
-    identification — not a live ``current_speaker`` read that a later turn's
-    identify could have already flipped to a different speaker. The tag then
-    rides ``frame.text`` unchanged through the (non-mutating) hallucination
+    Each turn's identity arrives in-band as an ``IdentitySnapshotFrame``
+    (emitted by ``SpeakerIDProcessor`` at the VAD boundary, ahead of the turn's
+    transcript). We queue those snapshots FIFO and pop one per transcript, so a
+    transcript is tagged with *its own* turn's identification — never a live
+    ``current_speaker`` a later turn could have flipped. A FIFO (not a single
+    "latest" slot) is required because ``IdentitySnapshotFrame`` is a
+    ``SystemFrame`` processed inline: a second turn's marker can be handled
+    before the first turn's queued ``TranscriptionFrame`` is dequeued, so order
+    — not recency — is what binds each transcript to its turn. Orphans can't
+    accumulate: ``SpeakerIDProcessor`` emits a marker only for turns the STT
+    will transcribe, so markers and transcripts stay 1:1.
+
+    ``apply_boundary`` (Task 6) is applied to each resolved snapshot to drop the
+    prior speaker's turns from the shared context on a continuity break. The tag
+    then rides ``frame.text`` unchanged through the (non-mutating) hallucination
     filter into the LLM context, so the LLM, Mem0, and the conversation log all
     see the same identity that was frozen at the turn boundary.
     """
 
-    def __init__(self, snapshot_provider: Callable[[], Awaitable[str]], **kwargs) -> None:
+    def __init__(self, apply_boundary: Callable[[str], str], **kwargs) -> None:
         super().__init__(**kwargs)
-        self._snapshot_provider = snapshot_provider
+        self._apply_boundary = apply_boundary
+        self._pending: deque[Awaitable[str]] = deque()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+        if isinstance(frame, IdentitySnapshotFrame):
+            # This turn's identity, arriving ahead of its transcript. Queue it;
+            # consume the frame (it is an internal handoff, never forwarded).
+            if frame.snapshot is not None:
+                self._pending.append(frame.snapshot)
+            return
         if isinstance(frame, TranscriptionFrame):
-            snapshot = await self._snapshot_provider()
+            pending = self._pending.popleft() if self._pending else None
+            snapshot = self._apply_boundary(await _resolve_turn_snapshot(pending))
             frame.text = format_speaker_tag(snapshot, frame.text)
         await self.push_frame(frame, direction)

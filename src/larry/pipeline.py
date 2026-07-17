@@ -711,12 +711,19 @@ async def run() -> None:
     # self-evolution gate stays only around registering the keep_about_self tool.
     _recency_line: dict[str, str | None] = {"value": None}
 
-    async def _refresh_system_prompt() -> None:
+    async def _refresh_system_prompt(*, turn_snapshot: str | None = None) -> None:
+        # The recency line is set on *confirmed* speaker change; on a new voice's
+        # unconfirmed ('unknown') turn that line still names the prior speaker, so
+        # pass this turn's snapshot to suppress it there (Codex P2). None (the
+        # keep_about_self + on_speaker_change callers) leaves it as stored.
+        recency = _recency_line["value"]
+        if turn_snapshot is not None:
+            recency = awareness.effective_recency_line(recency, turn_snapshot)
         messages = list(context.get_messages())
         new_system = _load_system_prompt(
             cfg.personality_path,
             cfg.self_layer_path,
-            recency_line=_recency_line["value"],
+            recency_line=recency,
         )
         for i, msg in enumerate(messages):
             if isinstance(msg, dict) and msg.get("role") == "system":
@@ -813,7 +820,9 @@ async def run() -> None:
                 if name is not None:
                     _pending["speaker"] = name
                 break
-        await _refresh_system_prompt()  # keep time register live every turn
+        # Pass this turn's frozen snapshot so the recency line is suppressed on an
+        # unconfirmed ('unknown') turn instead of naming the prior speaker.
+        await _refresh_system_prompt(turn_snapshot=_pending["speaker"])  # keep time register live
 
     @assistant_agg.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message) -> None:  # noqa: ARG001

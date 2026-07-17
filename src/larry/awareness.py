@@ -68,3 +68,20 @@ def recency_phrase(last_seen: str | None, now: datetime.datetime) -> str | None:
     if delta_days < 7:
         return f"{delta_days} days ago"
     return "a while ago"
+
+
+def effective_recency_line(stored: str | None, turn_snapshot: str) -> str | None:
+    """The recency line to actually show, given THIS turn's speaker snapshot.
+
+    ``stored`` is the recency line last set on a *confirmed* speaker change
+    (``"You are speaking with Alice. …"``). It is driven by confirmation, which
+    — under speaker hysteresis — does not fire on a new voice's first,
+    still-unconfirmed turn. On that turn the snapshot is ``"unknown"`` while the
+    stored line still names the previous speaker, so the prompt would claim
+    "You are speaking with Alice" over an unproven voice. Suppress it there;
+    pass it through on a named turn. Self-correcting: the stored value is never
+    mutated, so once the turn snapshots a name again the line reappears.
+    """
+    if turn_snapshot == "unknown":
+        return None
+    return stored

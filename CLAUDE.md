@@ -11,7 +11,7 @@ Cursed AI character in a motorized Halloween skull on a Raspberry Pi 5; runs on 
 **Pipeline order:**
 ```
 LocalAudioTransport
-  → SpeakerID (Resemblyzer)     # audio → identity; snapshots the turn's speaker at VAD-stop
+  → SpeakerID (WeSpeaker CAM++) # audio → identity; snapshots the turn's speaker at VAD-stop
   → GroqSTT
   → SpeakerTag                  # tags each transcript with the turn's frozen [speaker: name]
   → Mem0 (short-term memory)    # scoped per-turn to that snapshot; unknown turns get NO Mem0 I/O
@@ -59,6 +59,7 @@ macOS = dev, Pi 5 = production.
 
 - `uv run larry` — start main loop
 - `uv run larry enroll <name>` — record 10s voice for speaker ID
+- `uv run larry fetch-models` — pre-download the CAM++ speaker-embedder model (~28 MB); optional (auto-fetched on first run), handy for Pi provisioning
 - `uv run larry test-jaw` — sweep servo (Pi) or print mock angles (Mac)
 - `uv run pytest` — tests (Mac only; test code avoids hardware imports)
 - `uv run ruff check && uv run pyright` — lint and typecheck
@@ -101,4 +102,4 @@ Don't read `docs/RESEARCH_larry_stack.md` by default — reference only. Consult
 - Llama Guard or external content safety (Claude's instruction-following is the layer).
 - Voice cloning subscription (stock ElevenLabs voice `cPoqAvGWCPfCfyPMwe4z`).
 - Zep memory (Mem0 sufficient at our scale).
-- Pyannote diarization (Resemblyzer lighter, sufficient for ~15 known speakers).
+- Pyannote diarization (the CAM++ embedder is lighter, sufficient for ~15 known speakers).

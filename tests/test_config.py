@@ -238,9 +238,25 @@ def test_valid_config_constructs_without_error(required_keys):
 
 def test_speaker_id_defaults(required_keys):
     cfg = load_config()
-    assert cfg.speaker_match_threshold == 0.75
+    # Default embedder is CAM++, whose uncalibrated threshold is fail-closed (1.0 =
+    # matches nobody) until on-device calibration installs a real value.
+    assert cfg.speaker_match_threshold == 1.0
     assert cfg.speaker_change_turns == 2
     assert cfg.speaker_margin == 0.06
+
+
+def test_speaker_threshold_default_is_embedder_aware(monkeypatch, required_keys):
+    monkeypatch.delenv("SPEAKER_MATCH_THRESHOLD", raising=False)
+
+    monkeypatch.setenv("SPEAKER_EMBEDDER", "wespeaker_campplus")
+    assert load_config().speaker_match_threshold == 1.0  # fail-closed until calibrated
+
+    monkeypatch.setenv("SPEAKER_EMBEDDER", "resemblyzer")
+    assert load_config().speaker_match_threshold == 0.75  # legacy tuned value
+
+    # An explicit threshold overrides the embedder-derived default.
+    monkeypatch.setenv("SPEAKER_MATCH_THRESHOLD", "0.55")
+    assert load_config().speaker_match_threshold == 0.55
 
 
 def test_speaker_id_overrides(monkeypatch, required_keys):
@@ -273,10 +289,10 @@ def test_speaker_id_invalid_raises(monkeypatch, required_keys, env_var, bad_valu
     assert field_name in str(exc.value)
 
 
-def test_speaker_embedder_defaults_to_resemblyzer(monkeypatch, required_keys):
+def test_speaker_embedder_defaults_to_campplus(monkeypatch, required_keys):
     monkeypatch.delenv("SPEAKER_EMBEDDER", raising=False)
     cfg = load_config()
-    assert cfg.speaker_embedder == "resemblyzer"
+    assert cfg.speaker_embedder == "wespeaker_campplus"
 
 
 def test_speaker_embedder_override_normalized(monkeypatch, required_keys):

@@ -64,15 +64,15 @@ class Config:
     # speakers are enrolled (in [0, 1]; default 0.06 — rejects near-ties without
     # starving normal matches). Waived when < 2 speakers are enrolled (no runner-up).
     speaker_margin: float
-    # SpeakerEmbedder impl name (src/larry/speaker_embedder.py). Only "resemblyzer"
-    # is implemented; a future TitaNet/ONNX impl is a deferred follow-up (see Task 3
-    # in docs/superpowers/plans/2026-07-17-identity-and-wake-fixes.md). Voiceprints
-    # are namespaced by embedder name, so changing this requires every speaker to
-    # re-enroll.
+    # SpeakerEmbedder impl name (src/larry/speaker_embedder.py): "wespeaker_campplus"
+    # (default, CAM++ ONNX, 512-d) or "resemblyzer" (256-d, legacy). Voiceprints are
+    # namespaced by embedder name, so changing this requires every speaker to re-enroll.
     speaker_embedder: str
 
     # Paths
     data_dir: Path
+    # Download cache for fetched model files (CAM++ onnx); see model_fetch.py.
+    model_dir: Path
     speakers_db: Path
     conversations_db: Path
     mem0_dir: Path
@@ -158,10 +158,10 @@ class Config:
             "must be in [0, 1]",
         )
         _check(
-            self.speaker_embedder in {"resemblyzer"},
+            self.speaker_embedder in {"wespeaker_campplus", "resemblyzer"},
             "speaker_embedder",
             self.speaker_embedder,
-            "must be one of {'resemblyzer'}",
+            "must be one of {'wespeaker_campplus', 'resemblyzer'}",
         )
         _check(
             self.smart_turn_cpu_count >= 1,
@@ -212,6 +212,19 @@ def load_config() -> Config:
     # LLM_MODEL / ELEVENLABS_MODEL are the escape hatch if either goes stale.
     default_llm = "grok-4.20-non-reasoning" if xai_api_key else "anthropic/claude-sonnet-5"
 
+    # Speaker-match threshold/margin defaults are embedder-specific — cosine scale
+    # differs per model, so a Resemblyzer-tuned threshold must never be inherited by
+    # CAM++. CAM++ defaults FAIL-CLOSED (threshold 1.0 = matches nobody) until an
+    # operator installs a real threshold from on-device genuine+impostor calibration:
+    # a mismatched threshold could false-confirm a guest, and with a single speaker
+    # enrolled the margin gate is waived, so the threshold is the sole guard. An
+    # explicit SPEAKER_MATCH_THRESHOLD / SPEAKER_MARGIN env var overrides these.
+    speaker_embedder = os.environ.get("SPEAKER_EMBEDDER", "wespeaker_campplus").strip().lower()
+    _thr_default, _margin_default = {
+        "resemblyzer": ("0.75", "0.06"),
+        "wespeaker_campplus": ("1.0", "0.06"),
+    }.get(speaker_embedder, ("1.0", "0.06"))
+
     return Config(
         openrouter_api_key=_require("OPENROUTER_API_KEY"),
         openrouter_base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
@@ -231,11 +244,12 @@ def load_config() -> Config:
         wake_sleep_timeout_s=float(os.environ.get("WAKE_SLEEP_TIMEOUT_S", "20")),
         enable_smart_turn=_bool("ENABLE_SMART_TURN", smart_turn_default),
         smart_turn_cpu_count=int(os.environ.get("SMART_TURN_CPU_COUNT", "2")),
-        speaker_match_threshold=float(os.environ.get("SPEAKER_MATCH_THRESHOLD", "0.75")),
+        speaker_match_threshold=float(os.environ.get("SPEAKER_MATCH_THRESHOLD", _thr_default)),
         speaker_change_turns=int(os.environ.get("SPEAKER_CHANGE_TURNS", "2")),
-        speaker_margin=float(os.environ.get("SPEAKER_MARGIN", "0.06")),
-        speaker_embedder=os.environ.get("SPEAKER_EMBEDDER", "resemblyzer").strip().lower(),
+        speaker_margin=float(os.environ.get("SPEAKER_MARGIN", _margin_default)),
+        speaker_embedder=speaker_embedder,
         data_dir=data_dir,
+        model_dir=data_dir / "models",
         speakers_db=data_dir / "speakers.db",
         conversations_db=data_dir / "conversations.db",
         mem0_dir=data_dir / "mem0",

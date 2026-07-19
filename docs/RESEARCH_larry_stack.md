@@ -225,6 +225,13 @@ Example: Larry remembers Dave's coffee preference, the inside joke about Tuesday
 
 ## Speaker ID: Resemblyzer
 
+> **2026-07-19 divergence:** shipped default is now **WeSpeaker CAM++** (ONNX,
+> 512-d, ~0.71% EER) via onnxruntime + kaldi-native-fbank, not Resemblyzer.
+> Resemblyzer's cosine scores separated too weakly on far-field Jabra audio
+> (~0.60, below the 0.75 threshold), so a known speaker read as `unknown` almost
+> every turn. Resemblyzer stays selectable via `SPEAKER_EMBEDDER=resemblyzer`. The
+> rest of this section is the original rationale, kept for history.
+
 **Pick:** Resemblyzer
 
 Resemblyzer provides:

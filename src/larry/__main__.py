@@ -9,6 +9,7 @@ def main():
     parser = argparse.ArgumentParser(prog="larry")
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("test-jaw")
+    sub.add_parser("fetch-models")
     enroll = sub.add_parser("enroll")
     enroll.add_argument("name")
     args = parser.parse_args()
@@ -21,6 +22,10 @@ def main():
         from larry.cli.test_jaw import main as test_jaw_main
 
         test_jaw_main()
+    elif args.cmd == "fetch-models":
+        from larry.cli.fetch_models import main as fetch_models_main
+
+        fetch_models_main()
     else:
         from larry.pipeline import run
 

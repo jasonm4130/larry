@@ -298,7 +298,7 @@ def _by_content_embedder(monkeypatch, alice: np.ndarray, bob: np.ndarray) -> Non
     # First PCM sample sign selects the speaker, so a turn's audio bytes decide
     # its identity — lets a test thread distinct speakers through the real embed.
     fake.embed = lambda audio_f32_16k: alice if audio_f32_16k[0] > 0 else bob
-    monkeypatch.setattr(speaker_id, "get_speaker_embedder", lambda name: fake)
+    monkeypatch.setattr(speaker_id, "get_speaker_embedder", lambda name, model_dir=None: fake)
 
 
 def _audio(sample: int) -> InputAudioRawFrame:

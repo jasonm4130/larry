@@ -38,7 +38,7 @@ class _FakeEmbedder:
 def _patch_embedder(monkeypatch, module=speaker_id) -> _FakeEmbedder:
     """Monkeypatch ``get_speaker_embedder`` to hand back one fixed fake instance."""
     fake = _FakeEmbedder()
-    monkeypatch.setattr(module, "get_speaker_embedder", lambda name: fake)
+    monkeypatch.setattr(module, "get_speaker_embedder", lambda name, model_dir=None: fake)
     return fake
 
 

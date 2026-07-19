@@ -28,7 +28,7 @@ Larry is a conversational skull. He has a local wake word detector (listens for 
 | LLM | Grok-4.20 via xAI direct (default) → Claude Sonnet 5 via OpenRouter (fallback) |
 | Text-to-speech | ElevenLabs `eleven_flash_v2_5` (default; `eleven_v3` adds inline `[cackle]`-style tags, needs alpha access) |
 | Memory | Mem0 (self-hosted) |
-| Speaker ID | Resemblyzer |
+| Speaker ID | WeSpeaker CAM++ (ONNX) |
 | Hardware | Raspberry Pi 5, MG90S servo, PCA9685, Jabra Speak 510 (USB mic+speaker, hardware AEC) |
 
 ## How It Works

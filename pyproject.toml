@@ -16,6 +16,8 @@ dependencies = [
     "gpiozero>=2.0.1",
     "fastembed>=0.8.0",
     "pywebrtc-audio>=0.1.0",
+    "kaldi-native-fbank>=1.22.3",
+    "onnxruntime>=1.24.4",
 ]
 
 [project.optional-dependencies]

@@ -37,7 +37,7 @@ def main(name: str) -> None:
     wav = audio.squeeze()
 
     cfg = load_config()
-    embedder = get_speaker_embedder(cfg.speaker_embedder)
+    embedder = get_speaker_embedder(cfg.speaker_embedder, cfg.model_dir)
     embedding: np.ndarray = np.asarray(embedder.embed(wav))
 
     store_speaker(cfg.speakers_db, name, embedding, embedder=embedder.name)

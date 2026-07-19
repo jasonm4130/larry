@@ -386,6 +386,7 @@ async def run() -> None:
         change_turns=cfg.speaker_change_turns,
         margin=cfg.speaker_margin,
         embedder_name=cfg.speaker_embedder,
+        model_dir=cfg.model_dir,
         # Per-turn identity marker + embed only on the segmented-STT path, where
         # a downstream SpeakerTagProcessor consumes the marker. The xAI streaming
         # path has no tagger, so emitting markers (and running the embed) would

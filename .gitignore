@@ -11,6 +11,8 @@
 *.pcm
 *.wav
 *.mp3
+# ...but keep committed test-fixture audio (speaker-embedder golden gate)
+!tests/fixtures/*.wav
 
 # Runtime data — speaker embeddings, Mem0 store, conversation log
 /data/

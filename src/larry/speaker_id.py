@@ -40,6 +40,15 @@ from larry.voice_enroll import SAMPLE_RATE
 # embeds ever approach it, tie it to the encoder latency budget instead.
 _SNAPSHOT_AWAIT_TIMEOUT_S = 3.0
 
+# Upper bound on how much of a turn's audio the per-turn identify embed consumes.
+# The embed runs in a worker thread and holds ``_encoder_lock`` until it finishes,
+# while the tagger only times out its *await* (``_SNAPSHOT_AWAIT_TIMEOUT_S``) — so an
+# unbounded long turn would overrun that ceiling, hold the lock, and back subsequent
+# turns up into repeated 'unknown'/context-reset. A few seconds of voiced audio is
+# already more than enough for a stable speaker embedding, so cap the input (keeping
+# the most recent audio) to bound embed latency regardless of how long someone talks.
+_MAX_IDENTIFY_AUDIO_S = 8.0
+
 
 @dataclass
 class IdentitySnapshotFrame(SystemFrame):
@@ -220,6 +229,7 @@ class SpeakerIDProcessor(FrameProcessor):
         margin: float = 0.06,
         embedder_name: str = "resemblyzer",
         identify_enabled: bool = True,
+        model_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self._db_path = speakers_db_path
@@ -237,7 +247,7 @@ class SpeakerIDProcessor(FrameProcessor):
         # Construct the embedder first — its .name selects which voiceprints
         # are even loadable, so a print from a different embedder is never
         # cosine-matched (fail closed to 'unknown', not a garbage score).
-        self._encoder: SpeakerEmbedder = get_speaker_embedder(embedder_name)
+        self._encoder: SpeakerEmbedder = get_speaker_embedder(embedder_name, model_dir)
         self._enrolled: dict[str, np.ndarray] = load_enrolled(
             speakers_db_path, embedder=self._encoder.name
         )
@@ -412,6 +422,11 @@ class SpeakerIDProcessor(FrameProcessor):
         if not pcm_bytes:
             # Silence turn — no voiced audio to embed.  Fail closed, no encoder.
             return self._resolve_identity(None)
+        # Cap embed input to the most recent _MAX_IDENTIFY_AUDIO_S so a very long turn
+        # can't overrun the tagger's await ceiling while holding _encoder_lock.
+        max_bytes = int(_MAX_IDENTIFY_AUDIO_S * SAMPLE_RATE * 2)  # int16 mono → 2 bytes/sample
+        if len(pcm_bytes) > max_bytes:
+            pcm_bytes = pcm_bytes[-max_bytes:]
         audio = pcm16_to_float32(pcm_bytes)
         async with self._encoder_lock:
             embedding = np.asarray(await asyncio.to_thread(self._encoder.embed, audio))

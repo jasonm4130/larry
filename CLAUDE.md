@@ -1,105 +1,52 @@
 # Larry Project Guide
 
-## What Is Larry
+Voice-driven Halloween skull on a Pi 5. `README.md` covers the stack and quick start, `docs/ARCHITECTURE.md` the pipeline and module map, and `src/larry/pipeline.py`'s module docstring the authoritative pipeline order. Read those rather than a copy here.
 
-Cursed AI character in a motorized Halloween skull on a Raspberry Pi 5; runs on cloud APIs (Anthropic, ElevenLabs, Groq, Mem0) with voice in/out and a servo-controlled jaw.
+## Invariants
 
-## Architecture at a Glance
+**One immutable per-turn identity.** The speaker is snapshotted once at `VADUserStoppedSpeakingFrame` and that frozen value — never a live `current_speaker` — is threaded to the `[speaker: name]` tag, Mem0 retrieval, the deferred Mem0 store, and the conversation log. Any new consumer must take the same snapshot or it will cross-attribute a later turn. `unknown` turns are ephemeral: no Mem0 read, no Mem0 store.
 
-**Orchestration:** Pipecat (single Python process, self-hosted).
+**Identity requires segmented STT.** Keep `STT_PROVIDER=groq` (the default). `STT_PROVIDER=xai` is a single streaming WebSocket shared across turns: it carries the previous utterance's transcript into the next (the "looping" bug, confirmed on hardware) and disables per-speaker attribution entirely. Don't reach for it to cut latency.
 
-**Pipeline order:**
-```
-LocalAudioTransport
-  → SpeakerID (WeSpeaker CAM++) # audio → identity; snapshots the turn's speaker at VAD-stop
-  → GroqSTT
-  → SpeakerTag                  # tags each transcript with the turn's frozen [speaker: name]
-  → Mem0 (short-term memory)    # scoped per-turn to that snapshot; unknown turns get NO Mem0 I/O
-  → OpenAILLM (via OpenRouter → Claude Sonnet 5)
-  → ElevenLabsTTS
-  → AudioBufferProcessor (tap for jaw sync)
-  → transport.output
-```
+**The Strength-5 guardrails in `personality/larry.md` are immutable.** They are re-asserted as a system-prompt footer *after* the self-layer, so nothing Larry appends to `data/larry_self.md` can override them. Don't weaken them and don't move them ahead of the self-layer.
 
-**One immutable per-turn identity.** The speaker is identified once at the VAD boundary and that *frozen* value (not a live `current_speaker`) is threaded to the `[speaker: name]` tag, Mem0 retrieval, the Mem0 deferred store, and the conversation log — so none of them cross-attribute a later turn's speaker. `unknown` turns are ephemeral (no Mem0 read/store). This identity path requires **segmented STT** (`STT_PROVIDER=groq`, the default); `STT_PROVIDER=xai` is streaming, logs a loud warning, and disables per-speaker attribution (base single-namespace Mem0). Tag format + parser live in `src/larry/speaker_tag.py`; the tagger is `SpeakerTagProcessor` in `speaker_id.py`; the scoped store is `ScopedMem0MemoryService` in `memory.py`.
+**Never write prompts into `pipeline.py`.** Personality, tone and constraints live in `src/larry/personality/larry.md`, loaded at startup.
 
-**Wake word** ("Hey Larry") gates the pipeline via custom `FrameProcessor` in `wake.py` — OpenWakeWord (Apache-2.0, no API key). Default model `hey_jarvis`. Train a custom "Hey Larry" via the [OpenWakeWord Colab](https://colab.research.google.com/drive/1q1oe2zOyZp7UsB3jJiQ1IFn8z5YfjwEb) and point `WAKE_WORD_CUSTOM_PATH` at the resulting .onnx file.
+**No bracketed stage directions in Larry's output.** The card bans `[cackle]`, `[whispers]`, `[sigh]` and friends outright — the shipping TTS model reads brackets aloud as words. (`eleven_v3` would perform them; it needs alpha access and is not what ships.)
 
-## Where to Make Changes
+**CAM++ speaker matching fails closed by default.** `SPEAKER_MATCH_THRESHOLD` defaults to `1.0` for `wespeaker_campplus`, which matches nobody until an operator installs a threshold from on-device genuine+impostor calibration. "Identity always says unknown" is expected on a fresh install, not a bug.
 
-- **Personality / vibe**: `src/larry/personality/larry.md` (character card). Never edit prompts in `pipeline.py`.
-- **Audio tags** (`[cackle]`, `[whispers]`, etc.): also `personality/larry.md` — there's an explicit allow-list.
-- **Pipeline plumbing** (services, model swaps): `src/larry/pipeline.py`. For LLM model swaps, set `LLM_MODEL` env var (e.g. `LLM_MODEL=google/gemini-2.5-pro`) — no code change needed.
-- **Hardware**: `src/larry/hardware/`. `JawDriver` Protocol in `src/larry/jaw.py`. Mock impl in `hardware/jaw_mock.py`, real impl in `hardware/jaw_pca9685.py`. Select via `LARRY_HARDWARE=mock|pca9685`; defaults to mock on macOS, pca9685 on Linux/aarch64.
-- **Self-evolution**: Larry keeps an append-only self-layer at `data/larry_self.md` (his evolving self-concept, distinct from Mem0's per-person facts). Logic in `src/larry/self_layer.py`; he appends via the `keep_about_self` LLM tool and the layer is compacted on sleep when it exceeds `SELF_LAYER_CAP_CHARS` (default 5000). Toggle with `SELF_EVOLUTION_ENABLED`. His Strength-5 guardrails are re-asserted as an immutable prompt footer and are never editable by this layer.
-- **Voice tools (enrollment + dismiss)**: `src/larry/voice_enroll.py` (tool schemas + handler factories), plus the capture state machine in `src/larry/speaker_id.py` (`arm_capture`, `bot_stopped_speaking`, `add_capture_audio`). Toggle with `VOICE_TOOLS_ENABLED` (default true). `WakeWordGate.sleep_now()` is the dismiss entry point. CLI `uv run larry enroll <name>` uses the same `store_speaker` helper.
+## Two subsystems nothing else points at
 
-## Cross-Platform Development
+Neither `README.md` nor `docs/ARCHITECTURE.md` mentions either of these, and neither toggle is in `.env.example` — this is their only live pointer.
 
-macOS = dev, Pi 5 = production.
+- **Self-evolution** (`src/larry/self_layer.py`, `SELF_EVOLUTION_ENABLED`): Larry keeps an append-only self-concept at `data/larry_self.md`, distinct from Mem0's per-person facts. He appends via the `keep_about_self` LLM tool; the layer compacts on sleep past `SELF_LAYER_CAP_CHARS`.
+- **Voice tools** (`src/larry/voice_enroll.py`, `VOICE_TOOLS_ENABLED`, default true): in-conversation enrollment and dismiss, driven by a capture state machine in `speaker_id.py`. `WakeWordGate.sleep_now()` is the dismiss entry point; the CLI `enroll` shares the same `store_speaker` helper.
 
-- **macOS prerequisite**: `brew install portaudio` (Pipecat's `[local]` extra builds PyAudio against the system portaudio headers). Once is enough.
-- **Pi prerequisite**: `sudo apt install portaudio19-dev` (same reason, apt side).
-- **macOS**: `GPIOZERO_PIN_FACTORY=mock` makes all GPIO code no-ops. Run `uv sync` (no extras).
-- **Pi 5**: Uses `lgpio` pin factory (NOT `RPi.GPIO` — broken on Pi 5; NOT `pigpio` — no Pi 5 support). Run `uv sync --extra pi`.
-- **Pi-only deps** (`lgpio`, `adafruit-circuitpython-pca9685`, `adafruit-circuitpython-servokit`) live in `[project.optional-dependencies.pi]`.
-- **Dev tools** (`pytest`, `ruff`, `pyright`) live in `[dependency-groups.dev]` and install automatically with `uv sync`.
+## Cross-platform
 
-## Audio Hardware
+macOS = dev, Pi 5 = production. Both need portaudio for Pipecat's `[local]` extra — `brew install portaudio` on Mac, `sudo apt install portaudio19-dev` on the Pi. Once each.
 
-- **macOS dev**: built-in laptop mic + speaker. Acoustic feedback is real (Whisper transcribes Larry's own TTS) — **use headphones for any serious testing**. The software AEC (`src/larry/audio_filter.py`, WebRTC AEC3 via `pywebrtc-audio`) is loaded but marginal on a single-device acoustic loop. See [issue #1](https://github.com/jasonm4130/larry/issues/1).
-- **Pi 5 production**: **Jabra Speak 510** (USB-A conference speakerphone — mic + speaker + hardware AEC in one device). Solves the single-enclosure feedback problem in hardware. UAC-compliant, no vendor drivers, `snd-usb-audio` auto-detects.
-  - **Known PipeWire bug**: on PipeWire ≥ 23.10 the *speaker* side of the Jabra goes silent (mic still works). Fix: add `default.clock.quantum = 2048` to `/etc/pipewire/pipewire.conf`. Ref: [Ubuntu #2059401](https://bugs.launchpad.net/ubuntu/+source/pipewire/+bug/2059401).
-  - **Stay on Bookworm kernel 6.6**, not Trixie 6.12 — USB audio dropouts reported on 6.12.
-  - **Don't use HDMI on the Pi for the skull build** — there's a PipeWire/wireplumber restart bug on HDMI hotplug that kills USB audio mid-conversation.
-  - **Use the official Pi 5 PSU** (5V/5A). Undervoltage causes Jabra USB transfer failures.
-  - **Design implication**: with Jabra handling AEC in hardware, the software AEC + `STTMuteOnBotSpeech` cool-down become belt-and-braces, not primary defense. The skull is a visual prop; voice comes from the Jabra on the desk (jaw still syncs via `bot_audio` tap).
+- macOS: `GPIOZERO_PIN_FACTORY=mock`, `uv sync`.
+- Pi 5: `uv sync --extra pi`. The pin factory must be `lgpio` — `RPi.GPIO` is broken on Pi 5 and `pigpio` has no Pi 5 support.
 
-## Standard Commands
+Mac dev has a real acoustic feedback loop (Whisper transcribes Larry's own TTS back through the laptop mic). **Use headphones for any serious local testing** — the software AEC in `audio_filter.py` is marginal on a single-device loop. See [issue #1](https://github.com/jasonm4130/larry/issues/1). Pi production uses a Jabra Speak 510 whose hardware AEC solves this properly.
 
-- `uv run larry` — start main loop
-- `uv run larry enroll <name>` — record 10s voice for speaker ID
-- `uv run larry fetch-models` — pre-download the CAM++ speaker-embedder model (~28 MB); optional (auto-fetched on first run), handy for Pi provisioning
-- `uv run larry test-jaw` — sweep servo (Pi) or print mock angles (Mac)
-- `uv run pytest` — tests (Mac only; test code avoids hardware imports)
-- `uv run ruff check && uv run pyright` — lint and typecheck
+## Commands
 
-## API Keys
+- `uv run larry` — main loop
+- `uv run larry enroll <name>` — record 10s of voice for speaker ID
+- `uv run larry fetch-models` — pre-download the CAM++ embedder; optional (auto-fetched on first run), handy for Pi provisioning
+- `uv run larry test-jaw` — sweep the servo (Pi) or print mock angles (Mac)
+- `uv run pytest` — Mac only; test code avoids hardware imports
+- `uv run ruff check && uv run pyright`
 
-- **XAI_API_KEY** *(optional, preferred)*: when set, the main chat LLM routes direct to xAI (`grok-4.20-non-reasoning` default — ~600ms TTFT, ~20× cheaper than Claude per May 2026 research). Falls back to OpenRouter if unset.
-- **OPENROUTER_API_KEY**: always required for Mem0 fact extraction (Claude Haiku 4.5). Also serves the main chat LLM if XAI_API_KEY is unset.
-- **GROQ_API_KEY**: Groq Whisper-large-v3-turbo (STT).
-- **ELEVENLABS_API_KEY**: ElevenLabs `eleven_flash_v2_5` (TTS, voice `cPoqAvGWCPfCfyPMwe4z`).
+## Gotchas
 
-Wake word runs locally via OpenWakeWord (Apache-2.0) — no API key required.
+- `OPENROUTER_API_KEY` is required even when `XAI_API_KEY` is set — Mem0's fact-extraction LLM always routes through OpenRouter. Every other key and tunable is documented in `.env.example`.
+- Proactive speech outside pipeline flow: `await task.queue_frame(TTSSpeakFrame(text=...))`.
+- Don't read `docs/RESEARCH_larry_stack.md` by default — it's reference material, for stack-level decisions only.
 
-Embeddings (Mem0 vector layer) run locally via FastEmbed (BAAI/bge-small-en-v1.5, ONNX, in-process) — no API key, no recurring cost. The `[local]` extra of Pipecat already pulls the audio stack; `fastembed` adds the embedding runtime.
+## Settled out of scope
 
-## Pipecat-Specific Gotchas
-
-- Default LLM model depends on which provider is active: `grok-4.20-non-reasoning` via `GrokLLMService` when `XAI_API_KEY` is set (preferred path), else `anthropic/claude-sonnet-5` via `OpenAILLMService` + OpenRouter. Override with `LLM_MODEL` env var; model name semantics differ by provider (prefixed `x-ai/grok-...` for OpenRouter, plain `grok-4.20-non-reasoning` for direct xAI).
-- Proactive utterances (speak outside pipeline flow): `await task.queue_frame(TTSSpeakFrame("..."))`
-- User idle detection: `UserIdleProcessor` from `pipecat.processors.user_idle_processor` (NOT a transport hook).
-- Jaw sync: `AudioBufferProcessor` after TTS, register `@event_handler("on_track_audio_data")`, consume `bot_audio` (not `user_audio`).
-- Mem0 blocking: `_store_messages` can lag replies; wrap in `asyncio.create_task` if Larry feels slow.
-
-## Personality Safety Boundaries
-
-**Hard line:** no slurs, no harassment on protected characteristics, no real-coworker impersonation, no self-harm encouragement, no threats.
-
-**Soft line:** stay in character under pushback; deflect rather than refuse for in-bounds prods.
-
-Both encoded in `personality/larry.md` as strength-5 (triple-nested) negative constraints. Don't weaken without explicit reason.
-
-## Working Preferences for AI Agents
-
-When spanning multiple independent files, dispatch parallel sub-agents (one per file or module). Orchestrator stays focused on integration and verification; subagents do file-level writing. Preserves context window across long sessions.
-
-Don't read `docs/RESEARCH_larry_stack.md` by default — reference only. Consult when making stack-level decisions.
-
-## Out of Scope
-
-- Llama Guard or external content safety (Claude's instruction-following is the layer).
-- Voice cloning subscription (stock ElevenLabs voice `cPoqAvGWCPfCfyPMwe4z`).
-- Zep memory (Mem0 sufficient at our scale).
-- Pyannote diarization (the CAM++ embedder is lighter, sufficient for ~15 known speakers).
+Llama Guard / external content safety, a voice-cloning subscription, Zep, pyannote diarization. Rationale is in `docs/RESEARCH_larry_stack.md`; don't re-litigate without new evidence.

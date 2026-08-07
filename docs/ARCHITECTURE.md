@@ -51,7 +51,7 @@ Green-bordered stages run locally on the Pi; blue-bordered stages are cloud APIs
 | `stt_mute_fix.py` | Mutes STT while Larry is speaking to avoid self-transcription |
 | `jaw.py` | `JawDriver` Protocol + RMS-to-angle mapper |
 | `hardware/jaw_mock.py` · `jaw_pca9685.py` | Mock (macOS) and real PCA9685 servo (Pi) backends |
-| `personality/larry.md` | The character card — voice, tone, safety constraints, audio-tag allow-list |
+| `personality/larry.md` | The character card — voice, tone, safety constraints, and the ban on bracketed stage directions |
 
 ## Hardware abstraction
 

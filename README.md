@@ -14,7 +14,7 @@ A cursed Halloween skull living on your office desk. Raspberry Pi 5 inside, moto
 
 ## What Is This
 
-Larry is a conversational skull. He has a local wake word detector (listens for "Hey Larry" via OpenWakeWord — no account needed), understands speech via cloud Whisper, generates responses via a cloud LLM (xAI's Grok by default, Anthropic's Claude as a fallback), and runs them through text-to-speech with custom audio tags like `[cackle]` and `[whispers]`. A PCA9685 servo driver moves his jaw while he speaks. He remembers who you are after you enroll (10 seconds of voice), and his personality is entirely driven by a Markdown file you can edit to make him meaner, sillier, or more pretentious.
+Larry is a conversational skull. He has a local wake word detector (listens for "Hey Larry" via OpenWakeWord — no account needed), understands speech via cloud Whisper, generates responses via a cloud LLM (xAI's Grok by default, Anthropic's Claude as a fallback), and runs them through text-to-speech. A PCA9685 servo driver moves his jaw while he speaks. He remembers who you are after you enroll (10 seconds of voice), and his personality is entirely driven by a Markdown file you can edit to make him meaner, sillier, or more pretentious.
 
 **TL;DR:** It's a toy for offices. Not practical. Extremely fun.
 
